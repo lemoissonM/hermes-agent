@@ -10,7 +10,10 @@ from uuid import UUID
 
 from symposa.db.session import session_scope, set_rls_context
 from symposa.runtime.context import SymposaContext, memory_key_for, set_context
-from symposa.services.inference_config import sanitize_auth_json
+from symposa.services.inference_config import (
+    materialize_workspace_skills,
+    sanitize_auth_json,
+)
 from symposa.services.runtime_paths import user_hermes_home, user_runtime_root
 from symposa2.services.profile import materialize_soul
 from symposa2.services.skills import materialize_skills
