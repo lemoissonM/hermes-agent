@@ -28,6 +28,7 @@ def register(ctx) -> None:
     ctx.register_hook("on_session_start", _on_session_start)
     ctx.register_hook("on_session_end", _on_session_end)
     ctx.register_hook("pre_tool_call", _pre_tool_call)
+    ctx.register_hook("transform_tool_result", _transform_tool_result)
     ctx.register_hook("post_llm_call", _post_llm_call)
     logger.info("Symposa plugin registered")
 
@@ -224,3 +225,82 @@ def _pre_tool_call(tool_name: str = "", arguments: Optional[Dict[str, Any]] = No
         return check_tool_path(tool_name, arguments or {})
     except ImportError:
         return None
+
+
+def _transform_tool_result(
+    tool_name: str = "",
+    args: Optional[Dict[str, Any]] = None,
+    result: Any = None,
+    **kwargs,
+) -> Optional[str]:
+    """Register workspace files and inject view/share URLs into tool results."""
+    if tool_name not in ("write_file", "patch"):
+        return None
+    try:
+        from symposa.runtime.context import get_context
+        from symposa.db.session import session_scope, set_rls_context
+        from symposa.services.files import file_to_dict, register_workspace_file
+    except ImportError:
+        return None
+
+    ctx = get_context()
+    if ctx is None:
+        return None
+
+    arguments = args or {}
+    path_str = arguments.get("path") or arguments.get("file_path")
+    if not isinstance(path_str, str) or not path_str.strip():
+        return None
+
+    if isinstance(result, str):
+        try:
+            import json
+
+            parsed = json.loads(result)
+        except json.JSONDecodeError:
+            return None
+    elif isinstance(result, dict):
+        parsed = result
+    else:
+        return None
+
+    if not parsed.get("success", True):
+        return None
+
+    written = parsed.get("path") or path_str
+    try:
+        from pathlib import Path
+
+        resolved = Path(written).expanduser()
+        if not resolved.is_absolute():
+            resolved = (Path.cwd() / resolved).resolve()
+        if not resolved.is_file():
+            return None
+    except OSError:
+        return None
+
+    try:
+        with session_scope() as session:
+            set_rls_context(session, str(ctx.company_id), str(ctx.user_id))
+            row = register_workspace_file(
+                session,
+                ctx.company_id,
+                ctx.user_id,
+                resolved,
+            )
+            urls = file_to_dict(row, include_share=True)
+    except (ImportError, FileNotFoundError, PermissionError, ValueError) as exc:
+        logger.debug("symposa file register skipped: %s", exc)
+        return None
+    except Exception as exc:
+        logger.warning("symposa file register failed: %s", exc)
+        return None
+
+    merged = dict(parsed)
+    merged["file_id"] = urls["id"]
+    merged["view_url"] = urls["view_url"]
+    merged["download_url"] = urls["download_url"]
+    merged["share_url"] = urls.get("share_url")
+    import json
+
+    return json.dumps(merged)

@@ -832,6 +832,21 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return raw, None
 
+    @staticmethod
+    def _symposa_web_auto_approve(
+        symposa_hermes_home: Optional[str],
+        symposa_context: Optional[Dict[str, str]],
+    ) -> bool:
+        """Symposa web UI: auto-approve dangerous commands (non-technical users).
+
+        Opt out with ``SYMPOSA_AUTO_APPROVE=0`` (or ``false``/``no``/``off``).
+        Hardline blocks (e.g. ``rm -rf /``) still apply — see ``tools/approval.py``.
+        """
+        if not (symposa_hermes_home or symposa_context):
+            return False
+        val = os.getenv("SYMPOSA_AUTO_APPROVE", "1").strip().lower()
+        return val not in ("0", "false", "no", "off")
+
     def _parse_symposa_hermes_home_header(
         self, request: "web.Request"
     ) -> tuple[Optional[str], Optional["web.Response"]]:
@@ -3497,6 +3512,9 @@ class APIServerAdapter(BasePlatformAdapter):
 
                 hermes_home_token = None
                 agent = None
+                symposa_auto_approve = self._symposa_web_auto_approve(
+                    symposa_hermes_home, symposa_context
+                )
                 try:
                     if symposa_hermes_home:
                         hermes_home_token = set_hermes_home_override(symposa_hermes_home)
@@ -3547,6 +3565,10 @@ class APIServerAdapter(BasePlatformAdapter):
                             platform="api_server",
                             session_key=approval_session_key,
                         )
+                        if symposa_auto_approve:
+                            from tools.approval import enable_session_yolo
+
+                            enable_session_yolo(approval_session_key)
                         register_gateway_notify(approval_session_key, _approval_notify)
                         r = agent.run_conversation(
                             user_message=user_message,
@@ -3557,6 +3579,13 @@ class APIServerAdapter(BasePlatformAdapter):
                         try:
                             unregister_gateway_notify(approval_session_key)
                         finally:
+                            if symposa_auto_approve:
+                                try:
+                                    from tools.approval import disable_session_yolo
+
+                                    disable_session_yolo(approval_session_key)
+                                except Exception:
+                                    pass
                             if approval_token is not None:
                                 try:
                                     reset_current_session_key(approval_token)

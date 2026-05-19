@@ -65,6 +65,7 @@ def bootstrap_runtime(
         (hermes_home / sub).mkdir(parents=True, exist_ok=True)
     (runtime_root / "company").mkdir(parents=True, exist_ok=True)
     (runtime_root / "user").mkdir(parents=True, exist_ok=True)
+    (runtime_root / "user" / "outputs").mkdir(parents=True, exist_ok=True)
 
     mk = memory_key_for(company_id, user_id, conversation_id)
     ctx = SymposaContext(

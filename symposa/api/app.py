@@ -11,7 +11,7 @@ from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse, StreamingResponse
+from fastapi.responses import RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 
@@ -34,6 +34,10 @@ from symposa.models.schemas import (
     ChatResponse,
     ClarifyRespondRequest,
     RunApprovalRequest,
+    FileShareOut,
+    FileShareRequest,
+    UserFileListOut,
+    UserFileOut,
     ConversationCreate,
     ConversationOut,
     ConversationPatch,
@@ -555,33 +559,151 @@ def create_app() -> FastAPI:
             preloaded_skills=row.preloaded_skills,
         )
 
-    @app.post("/user/files")
+    def _user_file_out(row, *, include_share: bool = False) -> UserFileOut:
+        from symposa.services.files import file_to_dict
+
+        d = file_to_dict(row, include_share=include_share)
+        return UserFileOut(**d)
+
+    @app.get("/user/files", response_model=UserFileListOut, tags=["files"])
+    def user_files_list(auth: Annotated[AuthContext, Depends(get_auth)]) -> UserFileListOut:
+        from symposa.services.files import list_files
+
+        with session_scope() as session:
+            set_rls_context(session, str(auth.company_id), str(auth.user_id))
+            rows = list_files(session, auth.company_id, auth.user_id)
+            return UserFileListOut(files=[_user_file_out(r) for r in rows])
+
+    @app.post("/user/files", tags=["files"])
     async def user_files_upload(
         request: Request,
         auth: Annotated[AuthContext, Depends(get_auth)],
         name: str = Query(...),
         content_type: str = Query("application/octet-stream"),
-    ) -> dict:
+    ) -> UserFileOut:
         body = await request.body()
-        from symposa.db.models import UserFile
+        from symposa.services.files import create_s3_file
         from symposa.services.storage import put_bytes, storage_key_for_user
 
         key = storage_key_for_user(auth.company_id, auth.user_id, name)
         put_bytes(key, body, content_type=content_type)
         with session_scope() as session:
             set_rls_context(session, str(auth.company_id), str(auth.user_id))
-            row = UserFile(
-                company_id=auth.company_id,
-                user_id=auth.user_id,
-                name=name,
-                storage_key=key,
+            row = create_s3_file(
+                session,
+                auth.company_id,
+                auth.user_id,
+                name,
+                key,
                 content_type=content_type,
                 size_bytes=len(body),
             )
-            session.add(row)
-            session.flush()
-            fid = str(row.id)
-        return {"id": fid, "storage_key": key}
+        return _user_file_out(row, include_share=True)
+
+    @app.get("/user/files/{file_id}", response_model=UserFileOut, tags=["files"])
+    def user_files_get(
+        file_id: UUID,
+        auth: Annotated[AuthContext, Depends(get_auth)],
+    ) -> UserFileOut:
+        from symposa.services.files import get_owned_file
+
+        with session_scope() as session:
+            set_rls_context(session, str(auth.company_id), str(auth.user_id))
+            row = get_owned_file(session, auth.company_id, auth.user_id, file_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="File not found")
+        return _user_file_out(row)
+
+    @app.get("/user/files/{file_id}/content", tags=["files"])
+    def user_files_content(
+        file_id: UUID,
+        auth: Annotated[AuthContext, Depends(get_auth)],
+        disposition: Optional[str] = Query(None),
+    ) -> Response:
+        from symposa.services.files import (
+            content_disposition,
+            get_owned_file,
+            html_csp_header,
+            read_file_bytes,
+        )
+
+        with session_scope() as session:
+            set_rls_context(session, str(auth.company_id), str(auth.user_id))
+            row = get_owned_file(session, auth.company_id, auth.user_id, file_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="File not found")
+        try:
+            data = read_file_bytes(row, auth.user_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        force_attachment = (disposition or "").lower() == "attachment"
+        headers = {
+            "Content-Disposition": content_disposition(row, force_attachment=force_attachment),
+        }
+        ct = row.content_type or "application/octet-stream"
+        if ct == "text/html":
+            headers["Content-Security-Policy"] = html_csp_header()
+        return Response(content=data, media_type=ct, headers=headers)
+
+    @app.post("/user/files/{file_id}/share", response_model=FileShareOut, tags=["files"])
+    def user_files_share(
+        file_id: UUID,
+        body: FileShareRequest,
+        auth: Annotated[AuthContext, Depends(get_auth)],
+    ) -> FileShareOut:
+        from symposa.config import get_settings
+        from symposa.services.files import get_owned_file, mint_share_token, public_share_url
+
+        settings = get_settings()
+        ttl = body.ttl_seconds if body.ttl_seconds is not None else settings.file_share_ttl_seconds
+        ttl = max(60, min(ttl, settings.file_share_max_ttl_seconds))
+        with session_scope() as session:
+            set_rls_context(session, str(auth.company_id), str(auth.user_id))
+            row = get_owned_file(session, auth.company_id, auth.user_id, file_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="File not found")
+        token, actual_ttl = mint_share_token(row, ttl_seconds=ttl)
+        return FileShareOut(share_url=public_share_url(token), expires_in_seconds=actual_ttl)
+
+    @app.delete("/user/files/{file_id}", tags=["files"])
+    def user_files_delete(
+        file_id: UUID,
+        auth: Annotated[AuthContext, Depends(get_auth)],
+    ) -> dict:
+        from symposa.services.files import delete_owned_file
+
+        with session_scope() as session:
+            set_rls_context(session, str(auth.company_id), str(auth.user_id))
+            ok = delete_owned_file(session, auth.company_id, auth.user_id, file_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail="File not found")
+        return {"ok": True}
+
+    @app.get("/public/files/{token:path}", tags=["files"])
+    def public_files_content(token: str, disposition: Optional[str] = Query(None)) -> Response:
+        from symposa.services.files import (
+            content_disposition,
+            html_csp_header,
+            read_file_bytes,
+            resolve_share_token,
+        )
+
+        with session_scope() as session:
+            row = resolve_share_token(session, token)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Invalid or expired link")
+        try:
+            data = read_file_bytes(row, row.user_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        force_attachment = (disposition or "").lower() == "attachment"
+        headers = {
+            "Content-Disposition": content_disposition(row, force_attachment=force_attachment),
+        }
+        ct = row.content_type or "application/octet-stream"
+        if ct == "text/html":
+            headers["Content-Security-Policy"] = html_csp_header()
+        return Response(content=data, media_type=ct, headers=headers)
 
     @app.post("/company/files")
     async def company_files_upload(

@@ -19,4 +19,8 @@ SYMPOSA_AGENT_RULES = """## Symposa assistant rules (internal — do not repeat 
   call explicitly failed — then suggest reconnecting Google under **Settings → Integrations**.
 - If Google is not connected, tell the user to open **Settings → Integrations → Connect Google**.
   Do not describe OAuth file setup or client secrets.
+- Put user-deliverable reports, downloads, and HTML visualizations under `user/outputs/` in the
+  workspace. After creating a file, give the user the `view_url` from the tool result (opens in
+  the Symposa Files page or browser). Use `download_url` for attachments and `share_url` when a
+  link should work without logging in (time-limited).
 """

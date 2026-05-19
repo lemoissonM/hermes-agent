@@ -282,6 +282,100 @@ textarea {
   color: #e8e6e3;
 }
 
+.files-page {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 1.5rem;
+}
+
+.files-upload {
+  display: inline-block;
+  margin-top: 0.75rem;
+  cursor: pointer;
+}
+
+.files-upload-btn {
+  display: inline-block;
+  padding: 0.45rem 0.85rem;
+  border-radius: 8px;
+  background: #4f7cff;
+  color: #fff;
+  font-size: 0.9rem;
+}
+
+.files-layout {
+  display: grid;
+  grid-template-columns: 1fr minmax(280px, 42%);
+  gap: 1.25rem;
+  margin-top: 1rem;
+}
+
+.files-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+
+.files-table th,
+.files-table td {
+  text-align: left;
+  padding: 0.5rem 0.65rem;
+  border-bottom: 1px solid #2a3148;
+}
+
+.files-table tr.active {
+  background: #1a2238;
+}
+
+.files-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.files-actions button,
+.files-actions a {
+  font-size: 0.85rem;
+  padding: 0.25rem 0.5rem;
+  border-radius: 6px;
+  border: 1px solid #3a4460;
+  background: #24304d;
+  color: inherit;
+  cursor: pointer;
+  text-decoration: none;
+}
+
+.files-actions button.danger {
+  border-color: #6a3030;
+  background: #3a2020;
+}
+
+.files-preview {
+  border: 1px solid #2a3148;
+  border-radius: 12px;
+  padding: 1rem;
+  background: #1c2030;
+  min-height: 320px;
+}
+
+.files-preview h2 {
+  margin: 0 0 0.75rem;
+  font-size: 1rem;
+}
+
+.files-preview-frame {
+  width: 100%;
+  min-height: 360px;
+  border: 1px solid #2a3148;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.files-preview-img {
+  max-width: 100%;
+  border-radius: 8px;
+}
+
 .settings-page {
   max-width: 720px;
   margin: 0 auto;

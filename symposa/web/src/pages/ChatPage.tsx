@@ -9,6 +9,7 @@ import {
   listEvents,
   streamChat,
   submitClarify,
+  submitRunApproval,
 } from "../api/client";
 import Composer from "../components/Composer";
 import MessageList, { Message } from "../components/MessageList";
@@ -100,6 +101,11 @@ export default function ChatPage() {
         setClarify(payload);
         setClarifyAnswer("");
       },
+      onApproval: (payload) => {
+        if (!activeId || !payload.run_id) return;
+        setToolStatus("Running approved command…");
+        void submitRunApproval(activeId, payload.run_id, "once").catch(console.error);
+      },
       onDone: async (payload) => {
         if (payload.hermes_session_id) {
           setHermesSessionId(payload.hermes_session_id);
@@ -182,6 +188,9 @@ export default function ChatPage() {
           </li>
           <li>
             <a href="/settings/skills">Skills</a>
+          </li>
+          <li>
+            <a href="/files">Files</a>
           </li>
         </ul>
         <button

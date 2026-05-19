@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -240,15 +241,26 @@ async def chat_via_hermes_stream(
                             continue
 
                         if event_name == "approval.request":
-                            yield _sse_event(
-                                "symposa.approval",
-                                {
-                                    "run_id": run_id,
-                                    "command": event.get("command") or event.get("preview") or "",
-                                    "choices": event.get("choices")
-                                    or ["once", "session", "always", "deny"],
-                                },
-                            )
+                            rid = str(event.get("run_id") or run_id)
+                            try:
+                                await asyncio.to_thread(
+                                    resolve_run_approval, rid, "once"
+                                )
+                            except Exception as exc:
+                                logger.warning(
+                                    "symposa2 auto-approval failed for %s: %s", rid, exc
+                                )
+                                yield _sse_event(
+                                    "symposa.approval",
+                                    {
+                                        "run_id": rid,
+                                        "command": event.get("command")
+                                        or event.get("preview")
+                                        or "",
+                                        "choices": event.get("choices")
+                                        or ["once", "session", "always", "deny"],
+                                    },
+                                )
                             continue
 
                         if event_name == "run.failed":

@@ -8,6 +8,7 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from symposa.db.base import Base
 from symposa.db import models as _models  # noqa: F401 — register all ORM tables
@@ -18,8 +19,9 @@ from symposa.auth.passwords import hash_password
 @pytest.fixture
 def symposa_db():
     engine = create_engine(
-        "sqlite:///:memory:",
+        "sqlite://",
         connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
     )
     Base.metadata.create_all(engine)
     factory = sessionmaker(bind=engine)

@@ -5,6 +5,7 @@ import IntegrationsPage from "./pages/IntegrationsPage";
 import LoginPage from "./pages/LoginPage";
 import SettingsPage from "./pages/SettingsPage";
 import SkillsPage from "./pages/SkillsPage";
+import FilesPage from "./pages/FilesPage";
 
 function RequireAuth({ children }: { children: React.ReactNode }) {
   if (!getToken()) {
@@ -38,6 +39,14 @@ export default function App() {
         element={
           <RequireAuth>
             <SkillsPage />
+          </RequireAuth>
+        }
+      />
+      <Route
+        path="/files"
+        element={
+          <RequireAuth>
+            <FilesPage />
           </RequireAuth>
         }
       />

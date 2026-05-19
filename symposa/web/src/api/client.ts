@@ -91,6 +91,19 @@ export async function submitClarify(
   if (!resp.ok) throw new Error("Failed to submit clarify response");
 }
 
+export async function submitRunApproval(
+  conversationId: string,
+  runId: string,
+  choice: "once" | "session" | "always" | "deny" = "once",
+): Promise<void> {
+  const resp = await fetch(`${API_BASE}/conversations/${conversationId}/approval`, {
+    method: "POST",
+    headers: authHeaders(),
+    body: JSON.stringify({ run_id: runId, choice }),
+  });
+  if (!resp.ok) throw new Error("Failed to submit approval");
+}
+
 export type StreamHandlers = {
   onDelta: (text: string) => void;
   onToolProgress?: (payload: Record<string, unknown>) => void;
@@ -321,6 +334,63 @@ export async function getGoogleConnectUrl(): Promise<string> {
   }
   const data = (await resp.json()) as { url: string };
   return data.url;
+}
+
+export type UserFile = {
+  id: string;
+  name: string;
+  source: string;
+  content_type?: string | null;
+  size_bytes?: number | null;
+  created_at: string;
+  view_url: string;
+  download_url: string;
+  share_url?: string | null;
+};
+
+export async function listUserFiles(): Promise<UserFile[]> {
+  const resp = await fetch(`${API_BASE}/user/files`, { headers: authHeaders() });
+  if (!resp.ok) throw new Error("Failed to load files");
+  const data = (await resp.json()) as { files: UserFile[] };
+  return data.files;
+}
+
+export function userFileContentUrl(fileId: string, disposition?: "attachment"): string {
+  const base = `${API_BASE}/user/files/${encodeURIComponent(fileId)}/content`;
+  return disposition === "attachment" ? `${base}?disposition=attachment` : base;
+}
+
+export async function fetchUserFileBlob(fileId: string): Promise<Blob> {
+  const resp = await fetch(userFileContentUrl(fileId), { headers: authHeaders() });
+  if (!resp.ok) throw new Error("Failed to load file");
+  return resp.blob();
+}
+
+export async function deleteUserFile(fileId: string): Promise<void> {
+  const resp = await fetch(`${API_BASE}/user/files/${encodeURIComponent(fileId)}`, {
+    method: "DELETE",
+    headers: authHeaders(),
+  });
+  if (!resp.ok) throw new Error("Failed to delete file");
+}
+
+export async function uploadUserFile(
+  file: File,
+): Promise<UserFile> {
+  const params = new URLSearchParams({
+    name: file.name,
+    content_type: file.type || "application/octet-stream",
+  });
+  const token = getToken();
+  const headers: Record<string, string> = {};
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const resp = await fetch(`${API_BASE}/user/files?${params}`, {
+    method: "POST",
+    headers,
+    body: await file.arrayBuffer(),
+  });
+  if (!resp.ok) throw new Error("Failed to upload file");
+  return resp.json();
 }
 
 export async function register(

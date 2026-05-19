@@ -49,7 +49,12 @@ class SymposaSettings:
         # LLM endpoint key (RunPod/Ollama), not the api_server Bearer token.
         self.llm_api_key = os.getenv("SYMPOSA_LLM_API_KEY", "key").strip()
         self.credential_encryption_key = os.getenv("SYMPOSA_CREDENTIAL_ENCRYPTION_KEY", "")
-        self.link_base_url = os.getenv("SYMPOSA_LINK_BASE_URL", "http://localhost:3000")
+        self.link_base_url = os.getenv("SYMPOSA_LINK_BASE_URL", "http://localhost:3000").rstrip("/")
+        self.file_share_ttl_seconds = int(os.getenv("SYMPOSA_FILE_SHARE_TTL_SECONDS", "3600"))
+        self.file_share_max_ttl_seconds = int(
+            os.getenv("SYMPOSA_FILE_SHARE_MAX_TTL_SECONDS", "604800")
+        )
+        self.file_sign_secret = os.getenv("SYMPOSA_FILE_SIGN_SECRET", "") or self.jwt_secret
         self.s3_endpoint = os.getenv("SYMPOSA_S3_ENDPOINT", "")
         self.s3_bucket = os.getenv("SYMPOSA_S3_BUCKET", "symposa")
         self.s3_access_key = os.getenv("SYMPOSA_S3_ACCESS_KEY", "")

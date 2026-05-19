@@ -80,6 +80,34 @@ class RunApprovalRequest(BaseModel):
     choice: str = Field(description="once | session | always | deny")
 
 
+class UserFileOut(BaseModel):
+    id: UUID
+    name: str
+    source: str
+    content_type: Optional[str] = None
+    size_bytes: Optional[int] = None
+    created_at: datetime
+    view_url: str
+    download_url: str
+    share_url: Optional[str] = None
+
+
+class UserFileListOut(BaseModel):
+    files: List[UserFileOut]
+
+
+class FileShareRequest(BaseModel):
+    ttl_seconds: Optional[int] = Field(
+        default=None,
+        description="Share link lifetime in seconds (capped by server max)",
+    )
+
+
+class FileShareOut(BaseModel):
+    share_url: str
+    expires_in_seconds: int
+
+
 class WhatsAppLinkRequest(BaseModel):
     external_id: str
 
