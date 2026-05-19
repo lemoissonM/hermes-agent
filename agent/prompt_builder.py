@@ -1176,26 +1176,56 @@ def build_skills_system_prompt(
             except Exception as e:
                 logger.debug("Could not read external skill description %s: %s", desc_file, e)
 
+    _PRIORITY_SKILL_CATEGORIES = frozenset({"custom", "_overrides"})
+
+    def _append_category_lines(
+        lines: list[str],
+        category: str,
+        skills: list[tuple[str, str]],
+    ) -> None:
+        cat_desc = category_descriptions.get(category, "")
+        if cat_desc:
+            lines.append(f"  {category}: {cat_desc}")
+        else:
+            lines.append(f"  {category}:")
+        seen_local: set[str] = set()
+        for name, desc in sorted(skills, key=lambda x: x[0]):
+            if name in seen_local:
+                continue
+            seen_local.add(name)
+            if desc:
+                lines.append(f"    - {name}: {desc}")
+            else:
+                lines.append(f"    - {name}")
+
     if not skills_by_category:
         result = ""
     else:
         index_lines = []
-        for category in sorted(skills_by_category.keys()):
-            cat_desc = category_descriptions.get(category, "")
-            if cat_desc:
-                index_lines.append(f"  {category}: {cat_desc}")
-            else:
-                index_lines.append(f"  {category}:")
-            # Deduplicate and sort skills within each category
-            seen = set()
-            for name, desc in sorted(skills_by_category[category], key=lambda x: x[0]):
-                if name in seen:
+        priority_skills: list[tuple[str, str]] = []
+        for priority_cat in ("custom", "_overrides"):
+            for name, desc in skills_by_category.pop(priority_cat, []):
+                priority_skills.append((name, desc))
+        if priority_skills:
+            index_lines.append("  Your skills (priority):")
+            seen_priority: set[str] = set()
+            for name, desc in sorted(priority_skills, key=lambda x: x[0]):
+                if name in seen_priority:
                     continue
-                seen.add(name)
+                seen_priority.add(name)
                 if desc:
                     index_lines.append(f"    - {name}: {desc}")
                 else:
                     index_lines.append(f"    - {name}")
+
+        for category in sorted(skills_by_category.keys()):
+            if category in _PRIORITY_SKILL_CATEGORIES:
+                continue
+            _append_category_lines(
+                index_lines,
+                category,
+                skills_by_category[category],
+            )
 
         result = (
             "## Skills (mandatory)\n"

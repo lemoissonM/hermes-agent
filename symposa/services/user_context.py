@@ -13,6 +13,7 @@ from symposa.services.agents import build_agent_prompt_block
 from symposa.services.branding import SYMPOSA_AGENT_RULES
 from symposa.services.google_oauth import google_workspace_status
 from symposa.services.identity_files import load_identity_files_block
+from symposa.services.user_skills_prompt import build_user_skills_preload_block
 
 
 def build_user_context_block(
@@ -81,4 +82,12 @@ def build_user_context_block(
     identity_block = load_identity_files_block(user_id)
     if identity_block:
         parts.append(identity_block)
+    skills_block = build_user_skills_preload_block(
+        session,
+        company_id,
+        user_id,
+        task_id=str(conversation_id) if conversation_id else None,
+    )
+    if skills_block:
+        parts.append(skills_block)
     return "\n".join(parts)

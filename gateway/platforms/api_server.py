@@ -3152,7 +3152,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
             if symposa_hermes_home:
                 token = set_hermes_home_override(symposa_hermes_home)
-            if symposa_context and not symposa2_mode:
+            if symposa_context:
                 self._set_symposa_context(
                     company_id=symposa_context["company_id"],
                     user_id=symposa_context["user_id"],
@@ -3202,7 +3202,7 @@ class APIServerAdapter(BasePlatformAdapter):
             finally:
                 if symposa2_mode:
                     self._clear_symposa2_tenant(symposa_hermes_home)
-                elif symposa_context:
+                if symposa_context:
                     self._clear_symposa_context()
                 if token is not None:
                     reset_hermes_home_override(token)
@@ -3529,7 +3529,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             symposa_context["company_id"],
                             symposa_context["user_id"],
                         )
-                    elif symposa_context and not symposa2_mode:
+                    if symposa_context:
                         self._set_symposa_context(
                             company_id=symposa_context["company_id"],
                             user_id=symposa_context["user_id"],
@@ -3605,7 +3605,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 finally:
                     if symposa2_mode:
                         self._clear_symposa2_tenant(symposa_hermes_home)
-                    elif symposa_context:
+                    if symposa_context:
                         self._clear_symposa_context()
                     if hermes_home_token is not None:
                         reset_hermes_home_override(hermes_home_token)

@@ -12,6 +12,7 @@ from sqlalchemy.pool import StaticPool
 
 from symposa.db.base import Base
 from symposa.db import models as _models  # noqa: F401 — register all ORM tables
+import symposa2.db.models as _s2_models  # noqa: F401 — register Symposa2 ORM tables
 from symposa.db.models import Company, User
 from symposa.auth.passwords import hash_password
 

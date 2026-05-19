@@ -80,15 +80,22 @@ def bootstrap_runtime(
     os.environ["HERMES_HOME"] = str(hermes_home)
 
     try:
+        from symposa.db.session import session_scope, set_rls_context
         from symposa.services.credentials import materialize_user_credentials
         from symposa.services.inference_config import (
             materialize_inference_config,
             materialize_workspace_skills,
             sanitize_auth_json,
         )
+        from symposa.services.skill_bundled import compute_symposa_bundled_allowlist
+        from symposa2.services.skills import materialize_skills
 
         materialize_user_credentials(company_id, user_id, hermes_home)
-        materialize_workspace_skills(hermes_home)
+        with session_scope() as session:
+            set_rls_context(session, str(company_id), str(user_id))
+            materialize_skills(session, company_id, user_id, hermes_home)
+            allowlist = compute_symposa_bundled_allowlist(session, company_id, user_id)
+            materialize_workspace_skills(hermes_home, allowlist=allowlist)
         materialize_inference_config(hermes_home)
         sanitize_auth_json(hermes_home)
         _log_google_credential_gaps(company_id, user_id, hermes_home)

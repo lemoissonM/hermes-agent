@@ -7,11 +7,12 @@ credentials, skills, and memory only.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import shutil
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 import yaml
 
@@ -31,17 +32,79 @@ def build_skills_config() -> Dict[str, Any]:
     return {"disabled": []}
 
 
-def materialize_workspace_skills(hermes_home: Path) -> None:
-    """Mirror bundled skills into a user's HERMES_HOME."""
+def _bundled_skills_stamp_path(hermes_home: Path) -> Path:
+    return hermes_home / ".symposa" / "bundled_skills_stamp.json"
+
+
+def _bundled_allowlist_revision(allowlist: List[str]) -> str:
+    payload = {"allowlist": sorted({(n or "").strip() for n in allowlist if (n or "").strip()})}
+    raw = json.dumps(payload, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
+def materialize_workspace_skills(
+    hermes_home: Path,
+    allowlist: Optional[List[str]] = None,
+) -> None:
+    """Mirror bundled skills into a user's HERMES_HOME.
+
+    When *allowlist* is provided, only those skills are copied and a stamp file
+    skips repeat work until the allowlist changes. When *allowlist* is ``None``,
+    copies the entire bundled tree (legacy behavior).
+    """
     bundled_dir = _bundled_skills_dir()
     if not bundled_dir.is_dir():
         logger.debug("Bundled skills directory not found: %s", bundled_dir)
         return
 
     target_root = hermes_home / "skills"
-    for skill_md in bundled_dir.rglob("SKILL.md"):
-        rel_dir = skill_md.parent.relative_to(bundled_dir)
-        shutil.copytree(skill_md.parent, target_root / rel_dir, dirs_exist_ok=True)
+    target_root.mkdir(parents=True, exist_ok=True)
+
+    if allowlist is None:
+        for skill_md in bundled_dir.rglob("SKILL.md"):
+            rel_dir = skill_md.parent.relative_to(bundled_dir)
+            shutil.copytree(skill_md.parent, target_root / rel_dir, dirs_exist_ok=True)
+        return
+
+    from symposa.services.skill_bundled import find_bundled_skill_dirs
+
+    normalized = sorted({(n or "").strip() for n in allowlist if (n or "").strip()})
+    revision = _bundled_allowlist_revision(normalized)
+    stamp_path = _bundled_skills_stamp_path(hermes_home)
+    if stamp_path.is_file():
+        try:
+            stamp = json.loads(stamp_path.read_text(encoding="utf-8"))
+            if isinstance(stamp, dict) and stamp.get("revision") == revision:
+                return
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.debug("Could not read bundled skills stamp: %s", exc)
+
+    old_allowlist: List[str] = []
+    if stamp_path.is_file():
+        try:
+            stamp = json.loads(stamp_path.read_text(encoding="utf-8"))
+            if isinstance(stamp, dict):
+                old_allowlist = list(stamp.get("allowlist") or [])
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    removed = set(old_allowlist) - set(normalized)
+    if removed:
+        for skill_dir in find_bundled_skill_dirs(bundled_dir, removed):
+            rel_dir = skill_dir.relative_to(bundled_dir)
+            dest = target_root / rel_dir
+            if dest.is_dir() and rel_dir.parts[:1] not in (("custom",), ("_overrides",)):
+                shutil.rmtree(dest, ignore_errors=True)
+
+    for skill_dir in find_bundled_skill_dirs(bundled_dir, normalized):
+        rel_dir = skill_dir.relative_to(bundled_dir)
+        shutil.copytree(skill_dir, target_root / rel_dir, dirs_exist_ok=True)
+
+    stamp_path.parent.mkdir(parents=True, exist_ok=True)
+    stamp_path.write_text(
+        json.dumps({"revision": revision, "allowlist": normalized}, indent=2),
+        encoding="utf-8",
+    )
 
 
 def materialize_inference_config(hermes_home: Path) -> bool:
