@@ -654,6 +654,12 @@ from gateway.restart import (
 )
 
 
+def _resolve_gateway_session_key(session_key: str) -> str:
+    from symposa.runtime.memory_key import resolve_gateway_session_key
+
+    return resolve_gateway_session_key(session_key)
+
+
 from gateway.whatsapp_identity import (
     canonical_whatsapp_identifier as _canonical_whatsapp_identifier,  # noqa: F401
     expand_whatsapp_aliases as _expand_whatsapp_auth_aliases,
@@ -5919,6 +5925,22 @@ class GatewayRunner:
                         source.platform.value if source.platform else "unknown",
                         source.chat_id or "unknown",
                     )
+                    _hook_reply = _result.get("send_reply")
+                    if isinstance(_hook_reply, str) and _hook_reply.strip():
+                        try:
+                            _hook_adapter = self.adapters.get(source.platform)
+                            if _hook_adapter is not None:
+                                await _hook_adapter.send(
+                                    source.chat_id,
+                                    _hook_reply.strip(),
+                                    metadata=self._thread_metadata_for_source(
+                                        source, self._reply_anchor_for_event(event)
+                                    ),
+                                )
+                        except Exception as _send_exc:
+                            logger.warning(
+                                "pre_gateway_dispatch send_reply failed: %s", _send_exc
+                            )
                     return None
                 if _action == "rewrite":
                     _new_text = _result.get("text")
@@ -13411,7 +13433,7 @@ class GatewayRunner:
         in a ``finally`` block.
         """
         from gateway.session_context import set_session_vars
-        return set_session_vars(
+        tokens = set_session_vars(
             platform=context.source.platform.value,
             chat_id=context.source.chat_id,
             chat_name=context.source.chat_name or "",
@@ -13420,6 +13442,20 @@ class GatewayRunner:
             user_name=str(context.source.user_name) if context.source.user_name else "",
             session_key=context.session_key,
         )
+        try:
+            from symposa2.services.gateway_hook import (
+                try_install_from_platform_user,
+                try_install_from_session_key,
+            )
+
+            if not try_install_from_session_key(context.session_key):
+                try_install_from_platform_user(
+                    context.source.platform.value,
+                    context.source.user_id or context.source.user_id_alt,
+                )
+        except Exception:
+            pass
+        return tokens
 
     def _clear_session_env(self, tokens: list) -> None:
         """Restore session context variables to their pre-handler values."""
@@ -15415,7 +15451,7 @@ class GatewayRunner:
                     chat_name=source.chat_name,
                     chat_type=source.chat_type,
                     thread_id=source.thread_id,
-                    gateway_session_key=session_key,
+                    gateway_session_key=_resolve_gateway_session_key(session_key),
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
                 )

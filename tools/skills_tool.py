@@ -88,6 +88,14 @@ logger = logging.getLogger(__name__)
 # skills all coexist here without polluting the git repo.
 HERMES_HOME = get_hermes_home()
 SKILLS_DIR = HERMES_HOME / "skills"
+_INITIAL_SKILLS_DIR = SKILLS_DIR
+
+
+def _current_skills_dir() -> Path:
+    """Return the active skills dir, honoring request-scoped HERMES_HOME."""
+    if SKILLS_DIR != _INITIAL_SKILLS_DIR:
+        return SKILLS_DIR
+    return get_hermes_home() / "skills"
 
 # Anthropic-recommended limits for progressive disclosure efficiency
 MAX_NAME_LENGTH = 64
@@ -451,9 +459,10 @@ def _get_category_from_path(skill_path: Path) -> Optional[str]:
     For paths like: ~/.hermes/skills/mlops/axolotl/SKILL.md -> "mlops"
     Also works for external skill dirs configured via skills.external_dirs.
     """
-    # Try the module-level SKILLS_DIR first (respects monkeypatching in tests),
+    # Try the active local skills dir first (respects monkeypatching in tests),
     # then fall back to external dirs from config.
-    dirs_to_check = [SKILLS_DIR]
+    current_skills_dir = _current_skills_dir()
+    dirs_to_check = [current_skills_dir]
     try:
         from agent.skill_utils import get_external_skills_dirs
         dirs_to_check.extend(get_external_skills_dirs())
@@ -568,8 +577,9 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
 
     # Scan local dir first, then external dirs (local takes precedence)
     dirs_to_scan = []
-    if SKILLS_DIR.exists():
-        dirs_to_scan.append(SKILLS_DIR)
+    current_skills_dir = _current_skills_dir()
+    if current_skills_dir.exists():
+        dirs_to_scan.append(current_skills_dir)
     dirs_to_scan.extend(get_external_skills_dirs())
 
     for scan_dir in dirs_to_scan:
@@ -687,8 +697,9 @@ def skills_list(category: str = None, task_id: str = None) -> str:
         JSON string with minimal skill info: name, description, category
     """
     try:
-        if not SKILLS_DIR.exists():
-            SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+        current_skills_dir = _current_skills_dir()
+        if not current_skills_dir.exists():
+            current_skills_dir.mkdir(parents=True, exist_ok=True)
             return json.dumps(
                 {
                     "success": True,
@@ -869,6 +880,35 @@ def skill_view(
         JSON string with skill content or error message
     """
     try:
+        # Symposa Postgres skill overrides (user > company) when sidecar is active.
+        try:
+            from symposa.runtime.context import get_context
+            from symposa.db.session import session_scope
+            from symposa.services.skills import resolve_skill_body
+
+            ctx = get_context()
+            if ctx is not None:
+                with session_scope() as session:
+                    resolved = resolve_skill_body(
+                        session, ctx.company_id, ctx.user_id, name.split(":")[-1]
+                    )
+                if resolved:
+                    body_md, desc = resolved
+                    return json.dumps(
+                        {
+                            "success": True,
+                            "name": name,
+                            "content": body_md,
+                            "description": desc or "",
+                            "source": "symposa_override",
+                        },
+                        ensure_ascii=False,
+                    )
+        except ImportError:
+            pass
+        except Exception:
+            logger.debug("symposa skill_view overlay skipped", exc_info=True)
+
         local_category_name: str | None = None
         # ── Qualified name dispatch (plugin skills) ──────────────────
         # Names containing ':' are routed to the plugin skill registry.
@@ -941,8 +981,9 @@ def skill_view(
 
         # Build list of all skill directories to search
         all_dirs = []
-        if SKILLS_DIR.exists():
-            all_dirs.append(SKILLS_DIR)
+        current_skills_dir = _current_skills_dir()
+        if current_skills_dir.exists():
+            all_dirs.append(current_skills_dir)
         all_dirs.extend(get_external_skills_dirs())
 
         if not all_dirs:
@@ -1062,7 +1103,8 @@ def skill_view(
         # Security: warn if skill is loaded from outside trusted directories
         # (local skills dir + configured external_dirs are all trusted)
         _outside_skills_dir = True
-        _trusted_dirs = [SKILLS_DIR.resolve()]
+        current_skills_dir = _current_skills_dir()
+        _trusted_dirs = [current_skills_dir.resolve()]
         try:
             _trusted_dirs.extend(d.resolve() for d in all_dirs[1:])
         except Exception:
@@ -1291,7 +1333,7 @@ def skill_view(
             linked_files["scripts"] = script_files
 
         try:
-            rel_path = str(skill_md.relative_to(SKILLS_DIR))
+            rel_path = str(skill_md.relative_to(_current_skills_dir()))
         except ValueError:
             # External skill — use path relative to the skill's own parent dir
             rel_path = str(skill_md.relative_to(skill_md.parent.parent)) if skill_md.parent.parent else skill_md.name
@@ -1565,4 +1607,3 @@ registry.register(
     check_fn=check_skills_requirements,
     emoji="📚",
 )
-

@@ -295,10 +295,21 @@ def _make_run_env(env: dict) -> dict:
     # Per-profile HOME isolation: redirect system tool configs (git, ssh, gh,
     # npm …) into {HERMES_HOME}/home/ when that directory exists.  Only the
     # subprocess sees the override — the Python process keeps the real HOME.
-    from hermes_constants import get_subprocess_home
+    from hermes_constants import get_hermes_home, get_subprocess_home
     _profile_home = get_subprocess_home()
     if _profile_home:
         run_env["HOME"] = _profile_home
+
+    # Symposa per-request HERMES_HOME override (ContextVar) must reach skill subprocesses.
+    run_env["HERMES_HOME"] = str(get_hermes_home())
+
+    # Tenant integration credentials (Symposa2 DB → ephemeral env overlay).
+    try:
+        from agent.tenant_credentials import get_integration_env_overlay
+
+        run_env.update(get_integration_env_overlay())
+    except Exception:
+        pass
 
     # Inject ContextVar-based session vars into subprocess env.
     # ContextVars don't propagate to child processes, so we bridge them here.

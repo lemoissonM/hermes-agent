@@ -33,8 +33,10 @@ import os
 import socket as _socket
 import re
 import sqlite3
+import threading
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 try:
@@ -669,6 +671,9 @@ class APIServerAdapter(BasePlatformAdapter):
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+        self._session_db_by_home: Dict[str, Any] = {}  # Per-user Symposa HERMES_HOME → SessionDB
+        self._session_db_by_home_lock = threading.Lock()
+        self._override_enabled_toolsets: Optional[list] = None
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -773,6 +778,7 @@ class APIServerAdapter(BasePlatformAdapter):
     # (e.g. ``agent:main:webui:dm:user-42``) while staying small enough
     # that the sanitized form is safe to pass into Honcho / state.db.
     _MAX_SESSION_HEADER_LEN = 256
+    _MAX_SYMPOSA_HOME_HEADER_LEN = 512
 
     def _parse_session_key_header(
         self, request: "web.Request"
@@ -826,6 +832,69 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return raw, None
 
+    def _parse_symposa_hermes_home_header(
+        self, request: "web.Request"
+    ) -> tuple[Optional[str], Optional["web.Response"]]:
+        """Extract and validate ``X-Symposa-Hermes-Home`` (per-user credential dir)."""
+        raw = request.headers.get("X-Symposa-Hermes-Home", "").strip()
+        if not raw:
+            return None, None
+
+        if re.search(r"[\r\n\x00]", raw):
+            return None, web.json_response(
+                {"error": {"message": "Invalid Symposa home path", "type": "invalid_request_error"}},
+                status=400,
+            )
+
+        if len(raw) > self._MAX_SYMPOSA_HOME_HEADER_LEN:
+            return None, web.json_response(
+                {"error": {"message": "Symposa home path too long", "type": "invalid_request_error"}},
+                status=400,
+            )
+
+        if ".." in raw.split("/"):
+            return None, web.json_response(
+                {"error": {"message": "Invalid Symposa home path", "type": "invalid_request_error"}},
+                status=400,
+            )
+
+        if not raw.startswith("/"):
+            return None, web.json_response(
+                {"error": {"message": "Symposa home path must be absolute", "type": "invalid_request_error"}},
+                status=400,
+            )
+
+        return raw, None
+
+    def _parse_symposa2_hermes_home_header(
+        self, request: "web.Request"
+    ) -> tuple[Optional[str], Optional["web.Response"]]:
+        """Extract ``X-Symposa2-Hermes-Home`` (per-user runtime dir for Symposa2)."""
+        raw = request.headers.get("X-Symposa2-Hermes-Home", "").strip()
+        if not raw:
+            return None, None
+        if re.search(r"[\r\n\x00]", raw):
+            return None, web.json_response(
+                {"error": {"message": "Invalid Symposa2 home path", "type": "invalid_request_error"}},
+                status=400,
+            )
+        if len(raw) > self._MAX_SYMPOSA_HOME_HEADER_LEN:
+            return None, web.json_response(
+                {"error": {"message": "Symposa2 home path too long", "type": "invalid_request_error"}},
+                status=400,
+            )
+        if ".." in raw.split("/"):
+            return None, web.json_response(
+                {"error": {"message": "Invalid Symposa2 home path", "type": "invalid_request_error"}},
+                status=400,
+            )
+        if not raw.startswith("/"):
+            return None, web.json_response(
+                {"error": {"message": "Symposa2 home path must be absolute", "type": "invalid_request_error"}},
+                status=400,
+            )
+        return raw, None
+
     # ------------------------------------------------------------------
     # Session DB helper
     # ------------------------------------------------------------------
@@ -844,6 +913,31 @@ class APIServerAdapter(BasePlatformAdapter):
                 logger.debug("SessionDB unavailable for API server: %s", e)
         return self._session_db
 
+    def _session_db_for_home(self, hermes_home: Optional[str]) -> Optional[Any]:
+        """Return SessionDB scoped to a Symposa per-user HERMES_HOME directory.
+
+        Symposa tenants must not share the gateway's ``state.db`` — that would
+        leak session history and cached system prompts across users.
+        """
+        if not hermes_home:
+            return self._ensure_session_db()
+        home_path = Path(hermes_home)
+        cache_key = str(home_path.resolve())
+        with self._session_db_by_home_lock:
+            cached = self._session_db_by_home.get(cache_key)
+            if cached is not None:
+                return cached
+        try:
+            from hermes_state import SessionDB
+
+            db = SessionDB(db_path=home_path / "state.db")
+        except Exception as e:
+            logger.debug("Per-user SessionDB unavailable for %s: %s", hermes_home, e)
+            return None
+        with self._session_db_by_home_lock:
+            self._session_db_by_home[cache_key] = db
+        return db
+
     # ------------------------------------------------------------------
     # Agent creation helper
     # ------------------------------------------------------------------
@@ -857,6 +951,13 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_start_callback=None,
         tool_complete_callback=None,
         gateway_session_key: Optional[str] = None,
+        inference_runtime: Optional[Dict[str, Any]] = None,
+        inference_model: Optional[str] = None,
+        clarify_callback=None,
+        platform: str = "api_server",
+        session_db: Optional[Any] = None,
+        load_soul_identity: bool = False,
+        skip_context_files: bool = False,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -877,12 +978,20 @@ class APIServerAdapter(BasePlatformAdapter):
         from gateway.run import _resolve_runtime_agent_kwargs, _resolve_gateway_model, _load_gateway_config, GatewayRunner
         from hermes_cli.tools_config import _get_platform_tools
 
-        runtime_kwargs = _resolve_runtime_agent_kwargs()
+        if inference_runtime is not None:
+            runtime_kwargs = dict(inference_runtime)
+            runtime_kwargs.pop("credential_pool", None)
+        else:
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
+            runtime_kwargs.pop("credential_pool", None)
         reasoning_config = GatewayRunner._load_reasoning_config()
-        model = _resolve_gateway_model()
+        model = inference_model if inference_model else _resolve_gateway_model()
 
         user_config = _load_gateway_config()
-        enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        if self._override_enabled_toolsets:
+            enabled_toolsets = sorted(self._override_enabled_toolsets)
+        else:
+            enabled_toolsets = sorted(_get_platform_tools(user_config, platform))
 
         max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
 
@@ -890,6 +999,9 @@ class APIServerAdapter(BasePlatformAdapter):
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
         fallback_model = GatewayRunner._load_fallback_model()
 
+        effective_session_db = (
+            session_db if session_db is not None else self._ensure_session_db()
+        )
         agent = AIAgent(
             model=model,
             **runtime_kwargs,
@@ -899,17 +1011,149 @@ class APIServerAdapter(BasePlatformAdapter):
             ephemeral_system_prompt=ephemeral_system_prompt or None,
             enabled_toolsets=enabled_toolsets,
             session_id=session_id,
-            platform="api_server",
+            platform=platform,
             stream_delta_callback=stream_delta_callback,
             tool_progress_callback=tool_progress_callback,
             tool_start_callback=tool_start_callback,
             tool_complete_callback=tool_complete_callback,
-            session_db=self._ensure_session_db(),
+            session_db=effective_session_db,
+            load_soul_identity=load_soul_identity,
+            skip_context_files=skip_context_files,
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
             gateway_session_key=gateway_session_key,
+            clarify_callback=clarify_callback,
         )
         return agent
+
+    def _parse_symposa_context_headers(
+        self, request: "web.Request"
+    ) -> Optional[Dict[str, str]]:
+        """Extract Symposa tenancy headers when present."""
+        company_id = request.headers.get("X-Symposa-Company-Id", "").strip()
+        user_id = request.headers.get("X-Symposa-User-Id", "").strip()
+        conversation_id = request.headers.get("X-Symposa-Conversation-Id", "").strip()
+        if not (company_id and user_id and conversation_id):
+            return None
+        return {
+            "company_id": company_id,
+            "user_id": user_id,
+            "conversation_id": conversation_id,
+        }
+
+    def _parse_symposa2_context_headers(
+        self, request: "web.Request"
+    ) -> Optional[Dict[str, str]]:
+        company_id = request.headers.get("X-Symposa2-Company-Id", "").strip()
+        user_id = request.headers.get("X-Symposa2-User-Id", "").strip()
+        conversation_id = request.headers.get("X-Symposa2-Conversation-Id", "").strip()
+        if not (company_id and user_id and conversation_id):
+            return None
+        return {
+            "company_id": company_id,
+            "user_id": user_id,
+            "conversation_id": conversation_id,
+        }
+
+    def _install_symposa2_tenant(self, company_id: str, user_id: str) -> None:
+        try:
+            from uuid import UUID
+
+            from symposa2.services.tenant_loader import install_tenant_credential_loader
+
+            install_tenant_credential_loader(UUID(company_id), UUID(user_id))
+        except Exception as exc:
+            logger.debug("Symposa2 tenant loader not installed: %s", exc)
+
+    def _clear_symposa2_tenant(self, symposa2_hermes_home: Optional[str]) -> None:
+        try:
+            from agent.tenant_credentials import clear_tenant_context
+            from symposa2.services.bootstrap import clear_runtime_credentials
+
+            clear_tenant_context()
+            if symposa2_hermes_home:
+                clear_runtime_credentials(Path(symposa2_hermes_home))
+        except Exception as exc:
+            logger.debug("Symposa2 tenant cleanup: %s", exc)
+
+    def _set_symposa_context(
+        self,
+        *,
+        company_id: str,
+        user_id: str,
+        conversation_id: str,
+        session_key: Optional[str],
+        symposa_hermes_home: Optional[str],
+        channel: str = "web",
+    ) -> None:
+        """Set SymposaContext for skill overrides and path guard in the gateway worker."""
+        try:
+            from uuid import UUID
+
+            from symposa.runtime.context import SymposaContext, memory_key_for, set_context
+
+            cid = UUID(company_id)
+            uid = UUID(user_id)
+            conv_id = UUID(conversation_id)
+            mk = session_key or memory_key_for(cid, uid, conv_id)
+            runtime_root = ""
+            if symposa_hermes_home:
+                runtime_root = str(Path(symposa_hermes_home).parent)
+            set_context(
+                SymposaContext(
+                    company_id=cid,
+                    user_id=uid,
+                    conversation_id=conv_id,
+                    memory_key=mk,
+                    runtime_root=runtime_root,
+                    channel=channel,
+                )
+            )
+        except Exception as exc:
+            logger.debug("Symposa context not set: %s", exc)
+
+    def _clear_symposa_context(self) -> None:
+        try:
+            from symposa.runtime.context import clear_context
+
+            clear_context()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _make_symposa_clarify_callback(
+        session_key: str,
+        clarify_event_put=None,
+    ):
+        """Blocking clarify callback for Symposa web (SSE + clarify_gateway)."""
+
+        def _cb(question: str, choices):
+            import uuid as _uuid
+
+            from tools import clarify_gateway as _clarify_mod
+
+            clarify_id = _uuid.uuid4().hex[:10]
+            _clarify_mod.register(
+                clarify_id=clarify_id,
+                session_key=session_key or "",
+                question=question,
+                choices=list(choices) if choices else None,
+            )
+            if clarify_event_put is not None:
+                payload = {
+                    "clarify_id": clarify_id,
+                    "question": question,
+                    "choices": list(choices) if choices else None,
+                }
+                clarify_event_put(("__symposa_clarify__", payload))
+
+            timeout = _clarify_mod.get_clarify_timeout()
+            response = _clarify_mod.wait_for_response(clarify_id, timeout=float(timeout))
+            if response is None or response == "":
+                return f"[user did not respond within {int(timeout / 60)}m]"
+            return response
+
+        return _cb
 
     # ------------------------------------------------------------------
     # HTTP Handlers
@@ -1025,6 +1269,57 @@ class APIServerAdapter(BasePlatformAdapter):
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
+
+        raw_ts = request.headers.get("X-Hermes-Enabled-Toolsets", "").strip()
+        if raw_ts:
+            self._override_enabled_toolsets = [
+                x.strip() for x in raw_ts.split(",") if x.strip()
+            ]
+        else:
+            self._override_enabled_toolsets = None
+
+        symposa_hermes_home, home_err = self._parse_symposa_hermes_home_header(request)
+        if home_err is not None:
+            return home_err
+
+        symposa2_hermes_home, home2_err = self._parse_symposa2_hermes_home_header(request)
+        if home2_err is not None:
+            return home2_err
+
+        effective_home = symposa2_hermes_home or symposa_hermes_home
+        if effective_home and not Path(effective_home).is_dir():
+            label = "Symposa2" if symposa2_hermes_home else "Symposa"
+            return web.json_response(
+                _openai_error(
+                    f"{label} runtime home not found on the gateway host. "
+                    "Check SYMPOSA_RUNTIME_WSL_ROOT matches where the gateway runs.",
+                    err_type="server_error",
+                    code="symposa_home_missing",
+                ),
+                status=502,
+            )
+
+        try:
+            return await self._handle_chat_completions_body(
+                request,
+                symposa_hermes_home=effective_home,
+                symposa2_mode=bool(symposa2_hermes_home),
+            )
+        finally:
+            self._override_enabled_toolsets = None
+
+    async def _handle_chat_completions_body(
+        self,
+        request: "web.Request",
+        *,
+        symposa_hermes_home: Optional[str] = None,
+        symposa2_mode: bool = False,
+    ) -> "web.Response":
+        symposa_context = (
+            self._parse_symposa2_context_headers(request)
+            if symposa2_mode
+            else self._parse_symposa_context_headers(request)
+        )
 
         # Parse request body
         try:
@@ -1220,6 +1515,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                symposa_hermes_home=symposa_hermes_home,
+                symposa_context=symposa_context,
+                symposa2_mode=symposa2_mode,
+                clarify_event_put=_stream_q.put,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -1239,6 +1538,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                symposa_hermes_home=symposa_hermes_home,
+                symposa_context=symposa_context,
+                symposa2_mode=symposa2_mode,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -1374,6 +1676,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         try:
             last_activity = time.monotonic()
+            content_emitted = False
 
             # Role chunk
             role_chunk = {
@@ -1395,12 +1698,19 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation history.  See #6972 for the original event,
                 #16588 for the ``toolCallId``/``status`` lifecycle fields.
                 """
+                nonlocal last_activity, content_emitted
                 if isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
                     event_data = json.dumps(item[1])
                     await response.write(
                         f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode()
                     )
+                elif isinstance(item, tuple) and len(item) == 2 and item[0] == "__symposa_clarify__":
+                    event_data = json.dumps(item[1])
+                    await response.write(
+                        f"event: symposa.clarify\ndata: {event_data}\n\n".encode()
+                    )
                 else:
+                    content_emitted = True
                     content_chunk = {
                         "id": completion_id, "object": "chat.completion.chunk",
                         "created": created, "model": model,
@@ -1438,17 +1748,32 @@ class APIServerAdapter(BasePlatformAdapter):
 
             # Get usage from completed agent
             usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+            result: Dict[str, Any] = {}
             try:
                 result, agent_usage = await agent_task
                 usage = agent_usage or usage
             except Exception as exc:
                 logger.warning("Agent task %s failed, usage data lost: %s", completion_id, exc)
 
+            # Some failure paths (e.g. upstream 429) populate final_response
+            # without ever calling stream_delta_callback. Flush it so SSE
+            # clients see the same text non-streaming callers get.
+            final_response = str((result or {}).get("final_response") or "").strip()
+            if not content_emitted and final_response:
+                last_activity = await _emit(final_response)
+
+            if (result or {}).get("partial") and (result or {}).get("error") and "truncat" in str((result or {}).get("error", "")).lower():
+                finish_reason = "length"
+            elif (result or {}).get("failed") or ((result or {}).get("error") and not final_response):
+                finish_reason = "error"
+            else:
+                finish_reason = "stop"
+
             # Finish chunk
             finish_chunk = {
                 "id": completion_id, "object": "chat.completion.chunk",
                 "created": created, "model": model,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
                 "usage": {
                     "prompt_tokens": usage.get("input_tokens", 0),
                     "completion_tokens": usage.get("output_tokens", 0),
@@ -2743,6 +3068,10 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_complete_callback=None,
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
+        symposa_hermes_home: Optional[str] = None,
+        symposa_context: Optional[Dict[str, str]] = None,
+        symposa2_mode: bool = False,
+        clarify_event_put=None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -2756,39 +3085,115 @@ class APIServerAdapter(BasePlatformAdapter):
         another thread to stop in-progress LLM calls.
         """
         loop = asyncio.get_running_loop()
+        import contextvars
 
         def _run():
-            agent = self._create_agent(
-                ephemeral_system_prompt=ephemeral_system_prompt,
-                session_id=session_id,
-                stream_delta_callback=stream_delta_callback,
-                tool_progress_callback=tool_progress_callback,
-                tool_start_callback=tool_start_callback,
-                tool_complete_callback=tool_complete_callback,
-                gateway_session_key=gateway_session_key,
-            )
-            if agent_ref is not None:
-                agent_ref[0] = agent
-            effective_task_id = session_id or str(uuid.uuid4())
-            result = agent.run_conversation(
-                user_message=user_message,
-                conversation_history=conversation_history,
-                task_id=effective_task_id,
-            )
-            usage = {
-                "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
-                "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
-                "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
-            }
-            # Include the effective session ID in the result so callers
-            # (e.g. X-Hermes-Session-Id header) can track compression-
-            # triggered session rotations. (#16938)
-            _eff_sid = getattr(agent, "session_id", session_id)
-            if isinstance(_eff_sid, str) and _eff_sid:
-                result["session_id"] = _eff_sid
-            return result, usage
+            from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+            from gateway.run import _resolve_runtime_agent_kwargs, _resolve_gateway_model
 
-        return await loop.run_in_executor(None, _run)
+            token = None
+            inference_runtime = None
+            inference_model = None
+            clarify_callback = None
+            agent_platform = "api_server"
+            if symposa2_mode and (symposa_hermes_home or symposa_context):
+                inference_runtime = _resolve_runtime_agent_kwargs()
+                inference_model = _resolve_gateway_model()
+                inference_runtime.pop("credential_pool", None)
+                if symposa_hermes_home:
+                    try:
+                        from symposa.services.inference_config import sanitize_auth_json
+
+                        sanitize_auth_json(Path(symposa_hermes_home))
+                    except Exception:
+                        pass
+                if symposa_context:
+                    self._install_symposa2_tenant(
+                        symposa_context["company_id"],
+                        symposa_context["user_id"],
+                    )
+                if symposa_context or clarify_event_put is not None:
+                    clarify_callback = self._make_symposa_clarify_callback(
+                        gateway_session_key or "",
+                        clarify_event_put=clarify_event_put,
+                    )
+            elif symposa_hermes_home or symposa_context:
+                agent_platform = "symposa"
+                # Gateway-owned inference only; per-user home is credentials/skills/memory.
+                inference_runtime = _resolve_runtime_agent_kwargs()
+                inference_model = _resolve_gateway_model()
+                inference_runtime.pop("credential_pool", None)
+                if symposa_hermes_home:
+                    try:
+                        from symposa.services.inference_config import sanitize_auth_json
+
+                        sanitize_auth_json(Path(symposa_hermes_home))
+                    except Exception:
+                        pass
+                if symposa_context or clarify_event_put is not None:
+                    clarify_callback = self._make_symposa_clarify_callback(
+                        gateway_session_key or "",
+                        clarify_event_put=clarify_event_put,
+                    )
+            if symposa_hermes_home:
+                token = set_hermes_home_override(symposa_hermes_home)
+            if symposa_context and not symposa2_mode:
+                self._set_symposa_context(
+                    company_id=symposa_context["company_id"],
+                    user_id=symposa_context["user_id"],
+                    conversation_id=symposa_context["conversation_id"],
+                    session_key=gateway_session_key,
+                    symposa_hermes_home=symposa_hermes_home,
+                )
+            symposa_scoped = bool(symposa_hermes_home)
+            if symposa_scoped:
+                agent_platform = "api_server"
+            try:
+                agent = self._create_agent(
+                    ephemeral_system_prompt=ephemeral_system_prompt,
+                    session_id=session_id,
+                    stream_delta_callback=stream_delta_callback,
+                    tool_progress_callback=tool_progress_callback,
+                    tool_start_callback=tool_start_callback,
+                    tool_complete_callback=tool_complete_callback,
+                    gateway_session_key=gateway_session_key,
+                    inference_runtime=inference_runtime,
+                    inference_model=inference_model,
+                    clarify_callback=clarify_callback,
+                    platform=agent_platform,
+                    session_db=self._session_db_for_home(symposa_hermes_home)
+                    if symposa_scoped
+                    else None,
+                    load_soul_identity=symposa_scoped,
+                    skip_context_files=symposa_scoped,
+                )
+                if agent_ref is not None:
+                    agent_ref[0] = agent
+                effective_task_id = session_id or str(uuid.uuid4())
+                result = agent.run_conversation(
+                    user_message=user_message,
+                    conversation_history=conversation_history,
+                    task_id=effective_task_id,
+                )
+                usage = {
+                    "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
+                    "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
+                    "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
+                }
+                _eff_sid = getattr(agent, "session_id", session_id)
+                if isinstance(_eff_sid, str) and _eff_sid:
+                    result["session_id"] = _eff_sid
+                return result, usage
+            finally:
+                if symposa2_mode:
+                    self._clear_symposa2_tenant(symposa_hermes_home)
+                elif symposa_context:
+                    self._clear_symposa_context()
+                if token is not None:
+                    reset_hermes_home_override(token)
+
+        ctx = contextvars.copy_context()
+        return await loop.run_in_executor(None, ctx.run, _run)
 
     # ------------------------------------------------------------------
     # /v1/runs — structured event streaming
@@ -2865,10 +3270,72 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
+        raw_ts = request.headers.get("X-Hermes-Enabled-Toolsets", "").strip()
+        if raw_ts:
+            self._override_enabled_toolsets = [
+                x.strip() for x in raw_ts.split(",") if x.strip()
+            ]
+        else:
+            self._override_enabled_toolsets = None
+
+        symposa_hermes_home, home_err = self._parse_symposa_hermes_home_header(request)
+        if home_err is not None:
+            self._override_enabled_toolsets = None
+            return home_err
+
+        symposa2_hermes_home, home2_err = self._parse_symposa2_hermes_home_header(request)
+        if home2_err is not None:
+            self._override_enabled_toolsets = None
+            return home2_err
+
+        effective_home = symposa2_hermes_home or symposa_hermes_home
+        symposa2_mode = bool(symposa2_hermes_home)
+        if effective_home and not Path(effective_home).is_dir():
+            label = "Symposa2" if symposa2_mode else "Symposa"
+            self._override_enabled_toolsets = None
+            return web.json_response(
+                _openai_error(
+                    f"{label} runtime home not found on the gateway host. "
+                    "Check SYMPOSA_RUNTIME_WSL_ROOT matches where the gateway runs.",
+                    err_type="server_error",
+                    code="symposa_home_missing",
+                ),
+                status=502,
+            )
+
+        symposa_context = (
+            self._parse_symposa2_context_headers(request)
+            if symposa2_mode
+            else self._parse_symposa_context_headers(request)
+        )
+
         # Long-term memory scope header (see chat_completions for details).
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
+            self._override_enabled_toolsets = None
             return key_err
+
+        try:
+            return await self._handle_runs_body(
+                request,
+                gateway_session_key=gateway_session_key,
+                symposa_hermes_home=effective_home,
+                symposa2_mode=symposa2_mode,
+                symposa_context=symposa_context,
+            )
+        finally:
+            self._override_enabled_toolsets = None
+
+    async def _handle_runs_body(
+        self,
+        request: "web.Request",
+        *,
+        gateway_session_key: Optional[str],
+        symposa_hermes_home: Optional[str] = None,
+        symposa2_mode: bool = False,
+        symposa_context: Optional[Dict[str, str]] = None,
+    ) -> "web.Response":
+        """Core POST /v1/runs handler (Symposa-aware, terminal-equivalent agent runs)."""
 
         # Enforce concurrency limit
         if len(self._run_streams) >= self._MAX_CONCURRENT_RUNS:
@@ -2941,6 +3408,15 @@ class APIServerAdapter(BasePlatformAdapter):
         session_id = body.get("session_id") or stored_session_id or run_id
         approval_session_key = gateway_session_key or session_id or run_id
         ephemeral_system_prompt = instructions
+
+        if body.get("session_id") and not conversation_history and self._api_key:
+            try:
+                db = self._ensure_session_db()
+                if db is not None:
+                    conversation_history = db.get_messages_as_conversation(str(session_id))
+            except Exception as e:
+                logger.warning("Failed to load session history for run %s: %s", session_id, e)
+
         loop = asyncio.get_running_loop()
         q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
         created_at = time.time()
@@ -2973,51 +3449,99 @@ class APIServerAdapter(BasePlatformAdapter):
         )
 
         async def _run_and_close():
-            try:
-                self._set_run_status(run_id, "running")
-                agent = self._create_agent(
-                    ephemeral_system_prompt=ephemeral_system_prompt,
-                    session_id=session_id,
-                    stream_delta_callback=_text_cb,
-                    tool_progress_callback=event_cb,
-                    gateway_session_key=gateway_session_key,
+            import contextvars
+
+            from gateway.run import _resolve_runtime_agent_kwargs, _resolve_gateway_model
+
+            inference_runtime = None
+            inference_model = None
+            agent_platform = "api_server"
+            symposa_scoped = bool(symposa_hermes_home)
+
+            if symposa2_mode and (symposa_hermes_home or symposa_context):
+                inference_runtime = _resolve_runtime_agent_kwargs()
+                inference_model = _resolve_gateway_model()
+                inference_runtime.pop("credential_pool", None)
+            elif symposa_hermes_home or symposa_context:
+                inference_runtime = _resolve_runtime_agent_kwargs()
+                inference_model = _resolve_gateway_model()
+                inference_runtime.pop("credential_pool", None)
+
+            def _approval_notify(approval_data: Dict[str, Any]) -> None:
+                event = dict(approval_data or {})
+                event.update({
+                    "event": "approval.request",
+                    "run_id": run_id,
+                    "timestamp": time.time(),
+                    "choices": ["once", "session", "always", "deny"],
+                })
+                self._set_run_status(
+                    run_id,
+                    "waiting_for_approval",
+                    last_event="approval.request",
                 )
-                self._active_run_agents[run_id] = agent
+                try:
+                    loop.call_soon_threadsafe(q.put_nowait, event)
+                except Exception:
+                    pass
 
-                def _approval_notify(approval_data: Dict[str, Any]) -> None:
-                    event = dict(approval_data or {})
-                    event.update({
-                        "event": "approval.request",
-                        "run_id": run_id,
-                        "timestamp": time.time(),
-                        "choices": ["once", "session", "always", "deny"],
-                    })
-                    self._set_run_status(
-                        run_id,
-                        "waiting_for_approval",
-                        last_event="approval.request",
-                    )
-                    try:
-                        loop.call_soon_threadsafe(q.put_nowait, event)
-                    except Exception:
-                        pass
+            def _run_sync():
+                from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+                from gateway.session_context import clear_session_vars, set_session_vars
+                from tools.approval import (
+                    register_gateway_notify,
+                    reset_current_session_key,
+                    set_current_session_key,
+                    unregister_gateway_notify,
+                )
 
-                def _run_sync():
-                    from gateway.session_context import clear_session_vars, set_session_vars
-                    from tools.approval import (
-                        register_gateway_notify,
-                        reset_current_session_key,
-                        set_current_session_key,
-                        unregister_gateway_notify,
+                hermes_home_token = None
+                agent = None
+                try:
+                    if symposa_hermes_home:
+                        hermes_home_token = set_hermes_home_override(symposa_hermes_home)
+                        try:
+                            from symposa.services.inference_config import sanitize_auth_json
+
+                            sanitize_auth_json(Path(symposa_hermes_home))
+                        except Exception:
+                            pass
+                    if symposa2_mode and symposa_context:
+                        self._install_symposa2_tenant(
+                            symposa_context["company_id"],
+                            symposa_context["user_id"],
+                        )
+                    elif symposa_context and not symposa2_mode:
+                        self._set_symposa_context(
+                            company_id=symposa_context["company_id"],
+                            user_id=symposa_context["user_id"],
+                            conversation_id=symposa_context["conversation_id"],
+                            session_key=gateway_session_key,
+                            symposa_hermes_home=symposa_hermes_home,
+                        )
+
+                    self._set_run_status(run_id, "running")
+                    agent = self._create_agent(
+                        ephemeral_system_prompt=ephemeral_system_prompt,
+                        session_id=session_id,
+                        stream_delta_callback=_text_cb,
+                        tool_progress_callback=event_cb,
+                        gateway_session_key=gateway_session_key,
+                        inference_runtime=inference_runtime,
+                        inference_model=inference_model,
+                        platform=agent_platform,
+                        session_db=self._session_db_for_home(symposa_hermes_home)
+                        if symposa_scoped
+                        else None,
+                        load_soul_identity=symposa_scoped,
+                        skip_context_files=symposa_scoped,
                     )
+                    self._active_run_agents[run_id] = agent
 
                     effective_task_id = session_id or run_id
                     approval_token = None
                     session_tokens = []
                     try:
-                        # Bind approval/session identity for this API run via
-                        # contextvars so concurrent runs do not share process
-                        # environment state.
                         approval_token = set_current_session_key(approval_session_key)
                         session_tokens = set_session_vars(
                             platform="api_server",
@@ -3049,8 +3573,19 @@ class APIServerAdapter(BasePlatformAdapter):
                         "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
                     }
                     return r, u
+                finally:
+                    if symposa2_mode:
+                        self._clear_symposa2_tenant(symposa_hermes_home)
+                    elif symposa_context:
+                        self._clear_symposa_context()
+                    if hermes_home_token is not None:
+                        reset_hermes_home_override(hermes_home_token)
 
-                result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
+            try:
+                ctx = contextvars.copy_context()
+                result, usage = await asyncio.get_running_loop().run_in_executor(
+                    None, ctx.run, _run_sync
+                )
                 # Check for structured failure (non-retryable client errors like
                 # 401/400 return failed=True instead of raising, so the except
                 # block below never fires — issue #15561).
@@ -3146,11 +3681,13 @@ class APIServerAdapter(BasePlatformAdapter):
         if hasattr(task, "add_done_callback"):
             task.add_done_callback(self._background_tasks.discard)
 
-        response_headers = (
-            {"X-Hermes-Session-Key": gateway_session_key} if gateway_session_key else {}
-        )
+        response_headers: Dict[str, str] = {}
+        if gateway_session_key:
+            response_headers["X-Hermes-Session-Key"] = gateway_session_key
+        if session_id:
+            response_headers["X-Hermes-Session-Id"] = session_id
         return web.json_response(
-            {"run_id": run_id, "status": "started"},
+            {"run_id": run_id, "status": "started", "session_id": session_id},
             status=202,
             headers=response_headers,
         )
@@ -3383,6 +3920,32 @@ class APIServerAdapter(BasePlatformAdapter):
             for run_id in stale_statuses:
                 self._run_statuses.pop(run_id, None)
 
+    async def _handle_symposa_clarify(self, request: "web.Request") -> "web.Response":
+        """POST /v1/symposa/clarify — unblock a pending clarify in this gateway process."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, Exception):
+            return web.json_response(_openai_error("Invalid JSON in request body"), status=400)
+        clarify_id = str(body.get("clarify_id") or "").strip()
+        response = body.get("response")
+        if not clarify_id:
+            return web.json_response(
+                {"error": {"message": "clarify_id is required", "type": "invalid_request_error"}},
+                status=400,
+            )
+        from tools.clarify_gateway import resolve_gateway_clarify
+
+        ok = resolve_gateway_clarify(clarify_id, str(response) if response is not None else "")
+        if not ok:
+            return web.json_response(
+                {"error": {"message": "Clarify prompt not found or expired", "type": "invalid_request_error"}},
+                status=404,
+            )
+        return web.json_response({"ok": True})
+
     # ------------------------------------------------------------------
     # BasePlatformAdapter interface
     # ------------------------------------------------------------------
@@ -3403,6 +3966,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/models", self._handle_models)
             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
             self._app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
+            self._app.router.add_post("/v1/symposa/clarify", self._handle_symposa_clarify)
             self._app.router.add_post("/v1/responses", self._handle_responses)
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
             self._app.router.add_delete("/v1/responses/{response_id}", self._handle_delete_response)

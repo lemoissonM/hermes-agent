@@ -1,0 +1,10 @@
+name: symposa
+version: 0.1.0
+description: "Symposa multi-tenant sidecar — cross-channel conversations, identity, and path isolation."
+author: Symposa
+hooks:
+  - pre_gateway_dispatch
+  - on_session_start
+  - on_session_end
+  - pre_tool_call
+  - post_llm_call

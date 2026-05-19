@@ -29,6 +29,7 @@ from typing import Any, Dict, List, Optional
 
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY,
+    SYMPOSA_AGENT_IDENTITY,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE,
     KANBAN_GUIDANCE,
@@ -82,12 +83,16 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
 
     # ── Stable tier ────────────────────────────────────────────────
     stable_parts: List[str] = []
+    _platform_key = (agent.platform or "").lower().strip()
 
     # Try SOUL.md as primary identity unless the caller explicitly skipped it.
     # Some execution modes (cron) still want HERMES_HOME persona while keeping
     # cwd project instructions disabled.
     _soul_loaded = False
-    if agent.load_soul_identity or not agent.skip_context_files:
+    if _platform_key == "symposa":
+        stable_parts.append(SYMPOSA_AGENT_IDENTITY)
+        _soul_loaded = True
+    elif agent.load_soul_identity or not agent.skip_context_files:
         _soul_content = _r.load_soul_md()
         if _soul_content:
             stable_parts.append(_soul_content)
@@ -98,7 +103,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         stable_parts.append(DEFAULT_AGENT_IDENTITY)
 
     # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
-    stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
+    if _platform_key != "symposa":
+        stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
 
     # Tool-aware behavioral guidance: only inject when the tools are loaded
     tool_guidance = []
@@ -198,7 +204,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if _env_hints:
         stable_parts.append(_env_hints)
 
-    platform_key = (agent.platform or "").lower().strip()
+    platform_key = _platform_key
     if platform_key in PLATFORM_HINTS:
         stable_parts.append(PLATFORM_HINTS[platform_key])
     elif platform_key:

@@ -8,6 +8,7 @@ from unittest.mock import patch
 import pytest
 
 import tools.skills_tool as skills_tool_module
+from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from tools.skills_tool import (
     _get_required_environment_variables,
     _parse_frontmatter,
@@ -215,6 +216,24 @@ class TestFindAllSkills:
         names = {s["name"] for s in skills}
         assert "skill-a" in names
         assert "skill-b" in names
+
+    def test_uses_request_scoped_hermes_home_override(self, tmp_path):
+        original_skills_dir = skills_tool_module.SKILLS_DIR
+        home = tmp_path / "tenant-home"
+        skills_dir = home / "skills"
+        _make_skill(skills_dir, "tenant-skill")
+
+        token = set_hermes_home_override(home)
+        try:
+            skills = _find_all_skills()
+            payload = json.loads(skill_view("tenant-skill"))
+        finally:
+            reset_hermes_home_override(token)
+
+        assert skills_tool_module.SKILLS_DIR == original_skills_dir
+        assert [s["name"] for s in skills] == ["tenant-skill"]
+        assert payload["success"] is True
+        assert payload["name"] == "tenant-skill"
 
     def test_empty_directory(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):

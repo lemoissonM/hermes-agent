@@ -38,9 +38,13 @@ if _SCRIPTS_DIR not in sys.path:
 
 from _hermes_home import get_hermes_home
 
-HERMES_HOME = get_hermes_home()
-TOKEN_PATH = HERMES_HOME / "google_token.json"
-CLIENT_SECRET_PATH = HERMES_HOME / "google_client_secret.json"
+
+def _token_path() -> Path:
+    return get_hermes_home() / "google_token.json"
+
+
+def _client_secret_path() -> Path:
+    return get_hermes_home() / "google_client_secret.json"
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
@@ -62,7 +66,7 @@ def _normalize_authorized_user_payload(payload: dict) -> dict:
 
 
 def _ensure_authenticated():
-    if not TOKEN_PATH.exists():
+    if not _token_path().exists():
         print("Not authenticated. Run the setup script first:", file=sys.stderr)
         print(f"  python {Path(__file__).parent / 'setup.py'}", file=sys.stderr)
         sys.exit(1)
@@ -70,7 +74,7 @@ def _ensure_authenticated():
 
 def _stored_token_scopes() -> list[str]:
     try:
-        data = json.loads(TOKEN_PATH.read_text())
+        data = json.loads(_token_path().read_text())
     except Exception:
         return list(SCOPES)
     scopes = data.get("scopes")
@@ -88,7 +92,7 @@ def _gws_binary() -> str | None:
 
 def _gws_env() -> dict[str, str]:
     env = os.environ.copy()
-    env["GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE"] = str(TOKEN_PATH)
+    env["GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE"] = str(_token_path())
     return env
 
 
@@ -181,10 +185,10 @@ def get_credentials():
     from google.oauth2.credentials import Credentials
     from google.auth.transport.requests import Request
 
-    creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), _stored_token_scopes())
+    creds = Credentials.from_authorized_user_file(str(_token_path()), _stored_token_scopes())
     if creds.expired and creds.refresh_token:
         creds.refresh(Request())
-        TOKEN_PATH.write_text(
+        _token_path().write_text(
             json.dumps(
                 _normalize_authorized_user_payload(json.loads(creds.to_json())),
                 indent=2,

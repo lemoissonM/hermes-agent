@@ -1,0 +1,54 @@
+# Symposa local stack — Postgres, MinIO, API (Hermes + gateway run separately).
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: symposa
+      POSTGRES_PASSWORD: symposa
+      POSTGRES_DB: symposa
+    ports:
+      - "5432:5432"
+    volumes:
+      - symposa_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U symposa"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: symposa
+      MINIO_ROOT_PASSWORD: symposa-secret
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - symposa_minio:/data
+
+  symposa-api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.symposa-api
+    environment:
+      SYMPOSA_DATABASE_URL: postgresql+psycopg://symposa:symposa@postgres:5432/symposa
+      SYMPOSA_JWT_SECRET: dev-change-me
+      SYMPOSA_RUNTIME_ROOT: /var/symposa/runtime
+      SYMPOSA_HERMES_API_URL: http://host.docker.internal:8787/v1
+      SYMPOSA_S3_ENDPOINT: http://minio:9000
+      SYMPOSA_S3_BUCKET: symposa
+      SYMPOSA_S3_ACCESS_KEY: symposa
+      SYMPOSA_S3_SECRET_KEY: symposa-secret
+    ports:
+      - "8090:8090"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_started
+
+volumes:
+  symposa_pg:
+  symposa_minio:

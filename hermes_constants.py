@@ -5,10 +5,25 @@ without risk of circular imports.
 """
 
 import os
+from contextvars import ContextVar, Token
 from pathlib import Path
+from typing import Optional, Union
 
 
 _profile_fallback_warned: bool = False
+
+_hermes_home_override: ContextVar[Optional[Path]] = ContextVar(
+    "_hermes_home_override", default=None
+)
+
+
+def set_hermes_home_override(path: Union[str, Path]) -> Token:
+    """Request-scoped HERMES_HOME override (e.g. Symposa per-user runtime)."""
+    return _hermes_home_override.set(Path(path))
+
+
+def reset_hermes_home_override(token: Token) -> None:
+    _hermes_home_override.reset(token)
 
 
 def get_hermes_home() -> Path:
@@ -25,8 +40,15 @@ def get_hermes_home() -> Path:
     callers that import this at load time.  Subprocess spawners are
     expected to propagate ``HERMES_HOME`` explicitly (see the systemd
     template in ``hermes_cli/gateway.py`` and the kanban dispatcher in
-    ``hermes_cli/kanban_db.py``).  See https://github.com/NousResearch/hermes-agent/issues/18594.
+    ``hermes_cli/kanban_db.py``).      See https://github.com/NousResearch/hermes-agent/issues/18594.
+
+  Request-scoped override (Symposa api_server) takes precedence over
+  ``HERMES_HOME`` env — see ``set_hermes_home_override``.
     """
+    override = _hermes_home_override.get()
+    if override is not None:
+        return override
+
     val = os.environ.get("HERMES_HOME", "").strip()
     if val:
         return Path(val)

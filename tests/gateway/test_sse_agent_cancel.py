@@ -156,6 +156,46 @@ class TestSSEAgentCancelOnDisconnect:
 
         asyncio.run(run())
 
+    def test_flushes_final_response_when_no_stream_deltas(self):
+        """Upstream errors that skip stream_delta_callback still reach SSE clients."""
+        adapter = _make_adapter()
+
+        stream_q = queue.Queue()
+        stream_q.put(None)
+
+        async def fake_agent():
+            return {
+                "final_response": "API call failed after 3 retries",
+                "failed": True,
+            }, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+
+        async def run():
+            from aiohttp import web
+
+            agent_task = asyncio.ensure_future(fake_agent())
+            await asyncio.sleep(0)
+
+            writes: list[bytes] = []
+            mock_response = AsyncMock(spec=web.StreamResponse)
+
+            async def capture_write(data):
+                writes.append(data)
+
+            mock_response.write = AsyncMock(side_effect=capture_write)
+            mock_response.prepare = AsyncMock()
+
+            with patch("gateway.platforms.api_server.web.StreamResponse",
+                       return_value=mock_response):
+                await adapter._write_sse_chat_completion(
+                    _make_request(), "cmpl-flush", "gpt-4", 1234567890,
+                    stream_q, agent_task,
+                )
+
+            payload = b"".join(writes).decode()
+            assert "API call failed after 3 retries" in payload
+
+        asyncio.run(run())
+
     def test_already_done_task_not_cancelled_on_disconnect(self):
         """If agent already finished before disconnect, don't try to cancel."""
         adapter = _make_adapter()

@@ -1,0 +1,3 @@
+# Pin the Hermes upstream commit this fork last reconciled against.
+# Example: abc123def456789...
+unset

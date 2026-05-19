@@ -94,7 +94,19 @@ def register_credential_file(
 
     resolved = host_path.resolve()
     if not resolved.is_file():
-        logger.debug("credential_files: skipping %s (not found)", resolved)
+        try:
+            from agent.tenant_credentials import ensure_credential_file
+
+            tenant_path = ensure_credential_file(relative_path)
+            if tenant_path is not None and tenant_path.is_file():
+                resolved = tenant_path.resolve()
+        except ImportError:
+            pass
+        except Exception as exc:
+            logger.debug("tenant credential resolve skipped: %s", exc)
+
+    if not resolved.is_file():
+        logger.debug("credential_files: skipping %s (not found)", host_path)
         return False
 
     container_path = f"{container_base.rstrip('/')}/{relative_path}"
