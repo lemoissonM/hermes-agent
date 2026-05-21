@@ -47,6 +47,23 @@ class SkillCreate(BaseModel):
     description: Optional[str] = None
 
 
+class CompanySkillOut(BaseModel):
+    skill_name: str
+    description: Optional[str] = None
+    enabled: bool = True
+    is_custom: bool = False
+    has_body: bool = False
+    updated_at: Optional[datetime] = None
+
+
+class CompanySkillUpsert(BaseModel):
+    skill_name: str = Field(min_length=1, max_length=255)
+    description: Optional[str] = None
+    body_md: Optional[str] = None
+    enabled: bool = True
+    is_custom: bool = False
+
+
 class IntegrationStatusOut(BaseModel):
     provider: str
     label: str

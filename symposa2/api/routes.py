@@ -13,6 +13,8 @@ from symposa.db.session import session_scope, set_rls_context
 from symposa.services.identity import link_channel_identity
 from symposa.services.runtime_paths import user_hermes_home
 from symposa2.models.schemas import (
+    CompanySkillOut,
+    CompanySkillUpsert,
     IntegrationApiKeyPut,
     IntegrationStatusOut,
     ProfileOut,
@@ -32,14 +34,28 @@ from symposa2.services.credentials import (
 from symposa2.services.credential_registry import get_integration, list_integrations
 from symposa2.services.profile import build_soul_md, get_profile, materialize_soul, upsert_profile
 from symposa2.services.skills import (
+    delete_company_skill,
     delete_user_skill,
+    list_company_skills,
     get_user_skill,
     list_user_skills,
     materialize_skills,
     upsert_user_skill,
+    upsert_company_skill,
 )
 
 router = APIRouter(prefix="/v2", tags=["symposa2"])
+
+
+def _company_skill_out(row) -> CompanySkillOut:
+    return CompanySkillOut(
+        skill_name=row.skill_name,
+        description=row.description,
+        enabled=row.enabled,
+        is_custom=row.is_custom,
+        has_body=bool(row.body_md),
+        updated_at=row.updated_at,
+    )
 
 
 @router.get("/profile", response_model=ProfileOut)
@@ -182,6 +198,58 @@ def skills_delete(
             raise HTTPException(status_code=404, detail="Skill not found")
         home = user_hermes_home(auth.user_id)
         materialize_skills(session, auth.company_id, auth.user_id, home)
+    return {"ok": True}
+
+
+@router.get("/company/skills", response_model=List[CompanySkillOut])
+def company_skills_list(auth: Annotated[AuthContext, Depends(get_auth)]) -> List[CompanySkillOut]:
+    with session_scope() as session:
+        set_rls_context(session, str(auth.company_id), str(auth.user_id))
+        return [_company_skill_out(row) for row in list_company_skills(session, auth.company_id)]
+
+
+@router.put("/company/skills/{skill_name}", response_model=CompanySkillOut)
+def company_skills_put(
+    skill_name: str,
+    body: CompanySkillUpsert,
+    auth: Annotated[AuthContext, Depends(get_auth)],
+) -> CompanySkillOut:
+    if auth.role != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    with session_scope() as session:
+        set_rls_context(session, str(auth.company_id), str(auth.user_id))
+        row = upsert_company_skill(
+            session,
+            auth.company_id,
+            skill_name,
+            description=body.description,
+            body_md=body.body_md,
+            enabled=body.enabled,
+            is_custom=body.is_custom,
+        )
+        return _company_skill_out(row)
+
+
+@router.post("/company/skills", response_model=CompanySkillOut, status_code=201)
+def company_skills_create(
+    body: CompanySkillUpsert,
+    auth: Annotated[AuthContext, Depends(get_auth)],
+) -> CompanySkillOut:
+    return company_skills_put(body.skill_name, body, auth)
+
+
+@router.delete("/company/skills/{skill_name}")
+def company_skills_delete(
+    skill_name: str,
+    auth: Annotated[AuthContext, Depends(get_auth)],
+) -> dict:
+    if auth.role != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    with session_scope() as session:
+        set_rls_context(session, str(auth.company_id), str(auth.user_id))
+        ok = delete_company_skill(session, auth.company_id, skill_name)
+        if not ok:
+            raise HTTPException(status_code=404, detail="Skill not found")
     return {"ok": True}
 
 

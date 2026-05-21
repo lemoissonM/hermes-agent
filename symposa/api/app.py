@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, AsyncIterator, List, Optional
@@ -52,6 +53,10 @@ from symposa.models.schemas import (
     RegisterRequest,
     SkillPatchRequest,
     SkillsCatalogOut,
+    TenantOut,
+    TenantUpdate,
+    TenantUserCreate,
+    TenantUserOut,
     TokenResponse,
     ToolCatalogItem,
     ToolsCatalogOut,
@@ -90,6 +95,28 @@ def _event_out(row: ConversationEvent) -> EventOut:
         content_text=row.content_text,
         content_json=row.content_json,
         created_at=row.created_at,
+    )
+
+
+def _slugify(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    return slug or "tenant"
+
+
+def _tenant_out(company: Company) -> TenantOut:
+    return TenantOut(
+        id=company.id,
+        slug=company.slug or str(company.id),
+        name=company.name,
+        environment=company.environment,
+        region=company.region,
+        timezone=company.timezone,
+        currency=company.currency,
+        language=company.language,
+        status=company.status,
+        overview_md=company.overview_md,
+        governance_md=company.governance_md,
+        created_at=company.created_at,
     )
 
 
@@ -138,7 +165,7 @@ def create_app() -> FastAPI:
     @app.post("/auth/register", response_model=TokenResponse)
     def register(body: RegisterRequest) -> TokenResponse:
         with session_scope() as session:
-            company = Company(name=body.company_name)
+            company = Company(name=body.company_name, slug=f"{_slugify(body.company_name)}-{uuid4().hex[:6]}")
             session.add(company)
             session.flush()
             user = User(
@@ -189,12 +216,137 @@ def create_app() -> FastAPI:
 
     @app.get("/me", response_model=UserOut)
     def me(auth: Annotated[AuthContext, Depends(get_auth)]) -> UserOut:
+        with session_scope() as session:
+            company = session.get(Company, auth.company_id)
         return UserOut(
             id=auth.user_id,
             company_id=auth.company_id,
             email=auth.email,
             role=auth.role,
+            tenant_slug=company.slug if company else None,
+            company_name=company.name if company else None,
         )
+
+    @app.get("/company/tenant", response_model=TenantOut)
+    def tenant_get(auth: Annotated[AuthContext, Depends(get_auth)]) -> TenantOut:
+        with session_scope() as session:
+            company = session.get(Company, auth.company_id)
+            if company is None:
+                raise HTTPException(status_code=404, detail="Tenant not found")
+            return _tenant_out(company)
+
+    @app.patch("/company/tenant", response_model=TenantOut)
+    def tenant_update(
+        body: TenantUpdate,
+        auth: Annotated[AuthContext, Depends(get_auth)],
+    ) -> TenantOut:
+        if auth.role != "admin":
+            raise HTTPException(status_code=403, detail="Admin only")
+        with session_scope() as session:
+            company = session.get(Company, auth.company_id)
+            if company is None:
+                raise HTTPException(status_code=404, detail="Tenant not found")
+            for field in (
+                "name",
+                "environment",
+                "region",
+                "timezone",
+                "currency",
+                "language",
+                "status",
+                "overview_md",
+                "governance_md",
+            ):
+                value = getattr(body, field)
+                if value is not None:
+                    setattr(company, field, value)
+            if body.slug is not None:
+                company.slug = _slugify(body.slug)
+            session.flush()
+            return _tenant_out(company)
+
+    @app.get("/company/users", response_model=List[TenantUserOut])
+    def tenant_users_list(auth: Annotated[AuthContext, Depends(get_auth)]) -> List[TenantUserOut]:
+        if auth.role != "admin":
+            raise HTTPException(status_code=403, detail="Admin only")
+        with session_scope() as session:
+            users = list(session.query(User).filter(User.company_id == auth.company_id).order_by(User.created_at.asc()))
+            profile_by_user = {}
+            try:
+                from symposa2.db.models import S2UserProfile
+
+                rows = session.query(S2UserProfile).filter(S2UserProfile.company_id == auth.company_id)
+                profile_by_user = {row.user_id: row.display_name for row in rows}
+            except Exception:
+                profile_by_user = {}
+            return [
+                TenantUserOut(
+                    id=user.id,
+                    email=user.email,
+                    role=user.role,
+                    display_name=profile_by_user.get(user.id),
+                    created_at=user.created_at,
+                )
+                for user in users
+            ]
+
+    @app.post("/company/users", response_model=TenantUserOut, status_code=201)
+    def tenant_users_create(
+        body: TenantUserCreate,
+        auth: Annotated[AuthContext, Depends(get_auth)],
+    ) -> TenantUserOut:
+        if auth.role != "admin":
+            raise HTTPException(status_code=403, detail="Admin only")
+        role = "admin" if body.role in ("admin", "tenant_admin") else "member"
+        with session_scope() as session:
+            existing = session.query(User).filter(
+                User.company_id == auth.company_id,
+                User.email == body.email.lower(),
+            ).first()
+            if existing is not None:
+                raise HTTPException(status_code=409, detail="User already exists")
+            user = User(
+                company_id=auth.company_id,
+                email=body.email.lower(),
+                password_hash=hash_password(body.password),
+                role=role,
+            )
+            session.add(user)
+            session.flush()
+            link_channel_identity(session, auth.company_id, user.id, "web", str(user.id))
+            if body.display_name:
+                from symposa2.services.profile import upsert_profile
+
+                upsert_profile(
+                    session,
+                    auth.company_id,
+                    user.id,
+                    display_name=body.display_name,
+                    soul_md=None,
+                )
+            return TenantUserOut(
+                id=user.id,
+                email=user.email,
+                role=user.role,
+                display_name=body.display_name,
+                created_at=user.created_at,
+            )
+
+    @app.delete("/company/users/{user_id}")
+    def tenant_users_delete(
+        user_id: UUID,
+        auth: Annotated[AuthContext, Depends(get_auth)],
+    ) -> dict:
+        if auth.role != "admin":
+            raise HTTPException(status_code=403, detail="Admin only")
+        if user_id == auth.user_id:
+            raise HTTPException(status_code=400, detail="You cannot delete yourself")
+        with session_scope() as session:
+            user = session.query(User).filter(User.company_id == auth.company_id, User.id == user_id).first()
+            if user is None:
+                raise HTTPException(status_code=404, detail="User not found")
+            session.delete(user)
+        return {"ok": True}
 
     @app.get("/catalog/skills", response_model=SkillsCatalogOut)
     def catalog_skills(
@@ -705,7 +857,37 @@ def create_app() -> FastAPI:
             headers["Content-Security-Policy"] = html_csp_header()
         return Response(content=data, media_type=ct, headers=headers)
 
-    @app.post("/company/files")
+    def _company_file_out(row) -> UserFileOut:
+        base = get_settings().link_base_url.rstrip("/")
+        if base.endswith("/api"):
+            api_base = base
+        else:
+            api_base = f"{base}/api"
+        content_url = f"{api_base}/company/files/{row.id}/content"
+        return UserFileOut(
+            id=row.id,
+            name=row.name,
+            source="company",
+            content_type=row.content_type,
+            size_bytes=row.size_bytes,
+            created_at=row.created_at,
+            view_url=content_url,
+            download_url=f"{content_url}?disposition=attachment",
+        )
+
+    @app.get("/company/files", response_model=UserFileListOut, tags=["files"])
+    def company_files_list(auth: Annotated[AuthContext, Depends(get_auth)]) -> UserFileListOut:
+        from symposa.db.models import CompanyFile
+
+        with session_scope() as session:
+            rows = list(
+                session.query(CompanyFile)
+                .filter(CompanyFile.company_id == auth.company_id)
+                .order_by(CompanyFile.created_at.desc())
+            )
+            return UserFileListOut(files=[_company_file_out(row) for row in rows])
+
+    @app.post("/company/files", response_model=UserFileOut, tags=["files"])
     async def company_files_upload(
         request: Request,
         auth: Annotated[AuthContext, Depends(get_auth)],
@@ -730,8 +912,57 @@ def create_app() -> FastAPI:
             )
             session.add(row)
             session.flush()
-            fid = str(row.id)
-        return {"id": fid, "storage_key": key}
+            return _company_file_out(row)
+
+    @app.get("/company/files/{file_id}/content", tags=["files"])
+    def company_files_content(
+        file_id: UUID,
+        auth: Annotated[AuthContext, Depends(get_auth)],
+        disposition: Optional[str] = Query(None),
+    ) -> Response:
+        from symposa.db.models import CompanyFile
+        from symposa.services.files import content_disposition, html_csp_header
+        from symposa.services.storage import get_bytes
+
+        with session_scope() as session:
+            row = session.query(CompanyFile).filter(
+                CompanyFile.id == file_id,
+                CompanyFile.company_id == auth.company_id,
+            ).first()
+        if row is None:
+            raise HTTPException(status_code=404, detail="File not found")
+        data = get_bytes(row.storage_key)
+        if data is None:
+            raise HTTPException(status_code=404, detail="File bytes not found")
+        force_attachment = (disposition or "").lower() == "attachment"
+        headers = {
+            "Content-Disposition": content_disposition(row, force_attachment=force_attachment),
+        }
+        ct = row.content_type or "application/octet-stream"
+        if ct == "text/html":
+            headers["Content-Security-Policy"] = html_csp_header()
+        return Response(content=data, media_type=ct, headers=headers)
+
+    @app.delete("/company/files/{file_id}", tags=["files"])
+    def company_files_delete(
+        file_id: UUID,
+        auth: Annotated[AuthContext, Depends(get_auth)],
+    ) -> dict:
+        if auth.role != "admin":
+            raise HTTPException(status_code=403, detail="Admin only")
+        from symposa.db.models import CompanyFile
+        from symposa.services.storage import delete_object
+
+        with session_scope() as session:
+            row = session.query(CompanyFile).filter(
+                CompanyFile.id == file_id,
+                CompanyFile.company_id == auth.company_id,
+            ).first()
+            if row is None:
+                raise HTTPException(status_code=404, detail="File not found")
+            delete_object(row.storage_key)
+            session.delete(row)
+        return {"ok": True}
 
     @app.post("/user/credentials/{provider}")
     def user_credentials_put(

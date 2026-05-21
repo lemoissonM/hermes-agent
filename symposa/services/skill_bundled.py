@@ -47,7 +47,10 @@ def compute_symposa_bundled_allowlist(
     for item in company_preloaded or []:
         _add(str(item))
     try:
-        from symposa2.services.skills import list_user_skills
+        from symposa2.services.skills import enabled_company_skill_names, list_user_skills
+
+        for skill_name in enabled_company_skill_names(session, company_id):
+            _add(skill_name)
 
         for row in list_user_skills(session, company_id, user_id):
             if not row.is_custom:

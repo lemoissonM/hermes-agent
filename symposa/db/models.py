@@ -28,6 +28,15 @@ class Company(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
+    slug: Mapped[str | None] = mapped_column(String(128), nullable=True, unique=True)
+    environment: Mapped[str] = mapped_column(String(32), nullable=False, default="live")
+    region: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    timezone: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    currency: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    language: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    overview_md: Mapped[str | None] = mapped_column(Text, nullable=True)
+    governance_md: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
     users: Mapped[list["User"]] = relationship(back_populates="company")

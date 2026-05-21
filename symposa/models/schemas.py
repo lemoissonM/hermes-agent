@@ -31,6 +31,51 @@ class UserOut(BaseModel):
     company_id: UUID
     email: str
     role: str
+    tenant_slug: Optional[str] = None
+    company_name: Optional[str] = None
+
+
+class TenantOut(BaseModel):
+    id: UUID
+    slug: str
+    name: str
+    environment: str = "live"
+    region: Optional[str] = None
+    timezone: Optional[str] = None
+    currency: Optional[str] = None
+    language: Optional[str] = None
+    status: str = "active"
+    overview_md: Optional[str] = None
+    governance_md: Optional[str] = None
+    created_at: datetime
+
+
+class TenantUpdate(BaseModel):
+    name: Optional[str] = None
+    slug: Optional[str] = None
+    environment: Optional[str] = None
+    region: Optional[str] = None
+    timezone: Optional[str] = None
+    currency: Optional[str] = None
+    language: Optional[str] = None
+    status: Optional[str] = None
+    overview_md: Optional[str] = None
+    governance_md: Optional[str] = None
+
+
+class TenantUserOut(BaseModel):
+    id: UUID
+    email: str
+    role: str
+    display_name: Optional[str] = None
+    created_at: datetime
+
+
+class TenantUserCreate(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=8)
+    role: str = "member"
+    display_name: Optional[str] = None
 
 
 class ConversationCreate(BaseModel):

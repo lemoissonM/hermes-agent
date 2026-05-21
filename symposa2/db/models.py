@@ -64,6 +64,26 @@ class S2UserSkill(Base):
     )
 
 
+class S2CompanySkill(Base):
+    __tablename__ = "s2_company_skills"
+    __table_args__ = (
+        UniqueConstraint("company_id", "skill_name", name="uq_s2_company_skill"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    company_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("companies.id", ondelete="CASCADE"), nullable=False
+    )
+    skill_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    body_md: Mapped[str | None] = mapped_column(Text, nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    is_custom: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
 class S2CompanyCredential(Base):
     __tablename__ = "s2_company_credentials"
     __table_args__ = (
