@@ -218,14 +218,16 @@ def create_app() -> FastAPI:
     def me(auth: Annotated[AuthContext, Depends(get_auth)]) -> UserOut:
         with session_scope() as session:
             company = session.get(Company, auth.company_id)
-        return UserOut(
-            id=auth.user_id,
-            company_id=auth.company_id,
-            email=auth.email,
-            role=auth.role,
-            tenant_slug=company.slug if company else None,
-            company_name=company.name if company else None,
-        )
+            tenant_slug = company.slug if company else None
+            company_name = company.name if company else None
+            return UserOut(
+                id=auth.user_id,
+                company_id=auth.company_id,
+                email=auth.email,
+                role=auth.role,
+                tenant_slug=tenant_slug,
+                company_name=company_name,
+            )
 
     @app.get("/company/tenant", response_model=TenantOut)
     def tenant_get(auth: Annotated[AuthContext, Depends(get_auth)]) -> TenantOut:
